@@ -33,6 +33,10 @@ jobs:
 
   receiver-windows:
     runs-on: windows-latest
+    env:
+      # audiopus_sys'in paketlediği libopus eski cmake_minimum_required içeriyor;
+      # CMake 4.x bunu reddediyor. Bu değişken eski sürümle yapılandırmaya izin verir.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
