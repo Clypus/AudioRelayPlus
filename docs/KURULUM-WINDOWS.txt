@@ -1,0 +1,48 @@
+AudioRelayPlus - Windows Kurulumu
+==================================
+
+1) VB-Cable kur (tek seferlik, ucretsiz): https://vb-audio.com/Cable/
+   Zip'i ac -> VBCABLE_Setup_x64.exe'ye SAG TIK -> yonetici olarak calistir.
+
+2) arp-gui.exe'yi cift tikla ac.
+   - "Windows PC'nizi korudu" (mavi pencere) cikarsa: "Ek bilgi" -> "Yine de calistir".
+   - Guvenlik duvari sorarsa HEM OZEL HEM GENEL kutularini isaretleyip izin ver.
+   - "Cikis aygiti" listesinden "CABLE Input" sec.
+
+3) ONEMLI - Telefon PC'yi bulamiyorsa bu adimi yap (en sik sorun):
+   Windows cogu Wi-Fi agini "Genel" sayar ve gelen baglantilari keser.
+
+   KESIN COZUM - Baslat'a "cmd" yaz -> sag tik -> Yonetici olarak calistir ->
+   su satiri yapistir -> Enter:
+
+   netsh advfirewall firewall add rule name="AudioRelayPlus" dir=in action=allow protocol=UDP localport=48222
+
+   Ek olarak agi "Ozel" yapmak da iyi olur:
+   Ayarlar -> Ag ve Internet -> Wi-Fi -> bagli agin adina tikla ->
+   Ag profili turu: OZEL.
+
+4) Telefona APK'yi kur, uygulamayi ac. PC ayni Wi-Fi'daysa listede gorunur -> dokun.
+   (Ilk seferde mikrofon izni ve pil muafiyeti sorulur, onayla.)
+
+5) Discord/oyunda mikrofon olarak "CABLE Output" sec. Bitti!
+
+PC BULUNAMADI diyorsa (sirayla):
+- arp-gui.exe acik mi, pencerede kirmizi hata yazisi yok mu?
+- Telefon Wi-Fi'da mi, PC ile AYNI modeme mi bagli?
+  (mobil veri olmaz, "Misafir/Guest" agi olmaz)
+- Yukaridaki 3. adimi yaptin mi?
+- TESHIS: Telefonda "PC'leri Tara"ya basinca PC'deki pencerenin "Olaylar"
+  kisminda "kesif istegi geldi" satiri cikmali.
+  * Cikmiyorsa: paketler PC'ye ulasmiyor -> 3. adim + ayni ag kontrolu.
+  * Cikiyor ama telefon gormuyorsa: modemde "AP isolation / istemci
+    yalitimi" acik olabilir -> modem ayarindan kapat.
+- Son care manuel baglanti: PC'de Baslat -> cmd -> "ipconfig" yaz ->
+  "IPv4 Adresi" satirindaki adresi (192.168.x.x) telefondaki kutuya yaz ->
+  Baglan. Uygulama adresi hatirlar, bir daha gerek kalmaz.
+
+Ipuclari:
+- Ses dusukse: telefondaki "Mikrofon seviyesi" kaydiricisini yukselt.
+- Discord'da ses kesiliyorsa: Ayarlar -> Ses ve Goruntu ->
+  "Giris Hassasiyetini Otomatik Belirle" KAPAT, esigi sola cek;
+  Gurultu Engelleme'yi (Krisp) kapat.
+- Telefonda Xiaomi/Samsung vb.: Uygulama ayarlari -> Pil -> "Kisitlama yok".
