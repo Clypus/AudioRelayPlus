@@ -40,12 +40,14 @@ impl Default for JitterConfig {
         JitterConfig {
             sample_rate: 48000,
             frame_samples: 960,
-            start_target_ms: 80,
-            min_target_ms: 40,
+            // "Ani gelsin": USB/temiz ağda tampon 30 ms'e kadar iner;
+            // dalgalı Wi-Fi'da AIMD yine yukarı taşır.
+            start_target_ms: 60,
+            min_target_ms: 30,
             max_target_ms: 300,
             plc_limit_frames: 6,
             small_gap_frames: 3,
-            decrease_after_s: 15,
+            decrease_after_s: 10,
             hard_cap_ms: 400,
             resync_jump_frames: 500,
         }

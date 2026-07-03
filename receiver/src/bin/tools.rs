@@ -59,6 +59,9 @@ struct SendArgs {
     /// Rastgelelik tohumu (tekrarlanabilir testler için)
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// UDP yerine TCP kullan (USB/adb yolunun testi; kayıp/jitter yok sayılır)
+    #[arg(long)]
+    tcp: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -96,6 +99,56 @@ impl Rng {
     }
 }
 
+/// Gönderim + ACK okuma soyutlaması: UDP datagram ya da TCP çerçeve.
+enum Link {
+    Udp(UdpSocket),
+    Tcp(std::net::TcpStream),
+}
+
+impl Link {
+    fn send(&mut self, pkt: &[u8]) -> std::io::Result<()> {
+        match self {
+            Link::Udp(s) => s.send(pkt).map(|_| ()),
+            Link::Tcp(s) => {
+                use std::io::Write;
+                s.write_all(&proto::tcp_frame(pkt))
+            }
+        }
+    }
+
+    /// Bir paket okumaya çalışır (zaman aşımı ayarına tabi, bloklar).
+    fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Link::Udp(s) => s.recv(buf),
+            Link::Tcp(s) => {
+                use std::io::Read;
+                let mut hdr = [0u8; 2];
+                s.read_exact(&mut hdr)?;
+                let len = u16::from_be_bytes(hdr) as usize;
+                if len > buf.len() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "çerçeve büyük"));
+                }
+                s.read_exact(&mut buf[..len])?;
+                Ok(len)
+            }
+        }
+    }
+
+    fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Link::Udp(s) => s.set_read_timeout(t),
+            Link::Tcp(s) => s.set_read_timeout(t),
+        }
+    }
+
+    fn try_clone(&self) -> std::io::Result<Link> {
+        Ok(match self {
+            Link::Udp(s) => Link::Udp(s.try_clone()?),
+            Link::Tcp(s) => Link::Tcp(s.try_clone()?),
+        })
+    }
+}
+
 fn cmd_send(a: SendArgs) -> Result<()> {
     let codec = match a.codec.as_str() {
         "opus" => proto::Codec::Opus,
@@ -104,9 +157,20 @@ fn cmd_send(a: SendArgs) -> Result<()> {
     };
     let frame_samples = codec.frame_samples();
     let frame_ms = frame_samples as f64 * 1000.0 / proto::SAMPLE_RATE as f64;
+    if a.tcp && (a.loss > 0.0 || a.jitter > 0.0) {
+        eprintln!("not: --tcp modunda kayıp/jitter simülasyonu uygulanmaz");
+    }
 
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.connect(&a.target).with_context(|| format!("hedefe bağlanılamadı: {}", a.target))?;
+    let mut link = if a.tcp {
+        let s = std::net::TcpStream::connect(&a.target)
+            .with_context(|| format!("TCP hedefe bağlanılamadı: {}", a.target))?;
+        s.set_nodelay(true)?;
+        Link::Tcp(s)
+    } else {
+        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        sock.connect(&a.target).with_context(|| format!("hedefe bağlanılamadı: {}", a.target))?;
+        Link::Udp(sock)
+    };
 
     let mut rng = Rng::new(a.seed);
     let session: u32 = (rng.next_u64() >> 32) as u32;
@@ -119,12 +183,12 @@ fn cmd_send(a: SendArgs) -> Result<()> {
         codec,
         frame_ms: frame_ms as u8,
     });
-    sock.set_read_timeout(Some(Duration::from_millis(300)))?;
+    link.set_read_timeout(Some(Duration::from_millis(300)))?;
     let mut connected = false;
     let mut rbuf = [0u8; 512];
     for i in 0..10 {
-        sock.send(&hello)?;
-        if let Ok(n) = sock.recv(&mut rbuf) {
+        link.send(&hello)?;
+        if let Ok(n) = link.recv(&mut rbuf) {
             if let Some(proto::Packet::HelloAck { session: s }) = proto::parse(&rbuf[..n]) {
                 if s == session {
                     connected = true;
@@ -137,8 +201,39 @@ fn cmd_send(a: SendArgs) -> Result<()> {
         }
     }
     assert!(connected);
-    println!("bağlandı: {} (codec={:?}, session={session:08x})", a.target, codec);
-    sock.set_nonblocking(true)?;
+    println!(
+        "bağlandı: {} ({}, codec={:?}, session={session:08x})",
+        a.target,
+        if a.tcp { "TCP" } else { "UDP" },
+        codec
+    );
+
+    // ACK okuyucu iş parçacığı (RTT ölçümü) — TCP'de çerçeve senkronu için şart
+    let t0 = Instant::now();
+    let ack_stats = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0f64))); // (hb_acks, rtt_toplam_ms)
+    {
+        let mut rlink = link.try_clone()?;
+        rlink.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let ack_stats = ack_stats.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            loop {
+                match rlink.recv(&mut buf) {
+                    Ok(n) => {
+                        if let Some(proto::Packet::HeartbeatAck { session: s, time_ms }) = proto::parse(&buf[..n]) {
+                            if s == session {
+                                let mut g = ack_stats.lock().unwrap();
+                                g.0 += 1;
+                                g.1 += t0.elapsed().as_millis() as f64 - time_ms as f64;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     let mut enc = match codec {
         proto::Codec::Opus => {
@@ -160,12 +255,11 @@ fn cmd_send(a: SendArgs) -> Result<()> {
     let mut pcm = vec![0i16; frame_samples];
     let mut ebuf = vec![0u8; 1500];
 
-    let t0 = Instant::now();
+    let (loss, jitter) = if a.tcp { (0.0, 0.0) } else { (a.loss, a.jitter) };
     let mut heap: BinaryHeap<Reverse<(Instant, u64, Vec<u8>)>> = BinaryHeap::new();
     let mut heap_ctr = 0u64;
     let mut k = 0u32;
-    let (mut sim_dropped, mut sent, mut hb_acks) = (0u64, 0u64, 0u64);
-    let mut rtt_sum_ms = 0f64;
+    let (mut sim_dropped, mut sent) = (0u64, 0u64);
     let mut last_hb = Instant::now();
 
     while k < n_frames || !heap.is_empty() {
@@ -185,10 +279,10 @@ fn cmd_send(a: SendArgs) -> Result<()> {
                 None => pcm.iter().flat_map(|s| s.to_le_bytes()).collect(),
             };
             let pkt = proto::build_audio(session, k, k.wrapping_mul(frame_samples as u32), &payload);
-            if rng.unit() * 100.0 < a.loss {
+            if rng.unit() * 100.0 < loss {
                 sim_dropped += 1;
             } else {
-                let delay = Duration::from_secs_f64(rng.unit() * a.jitter / 1000.0);
+                let delay = Duration::from_secs_f64(rng.unit() * jitter / 1000.0);
                 heap.push(Reverse((now + delay, heap_ctr, pkt)));
                 heap_ctr += 1;
             }
@@ -199,27 +293,17 @@ fn cmd_send(a: SendArgs) -> Result<()> {
         if last_hb.elapsed() >= Duration::from_millis(500) {
             last_hb = Instant::now();
             let ms = t0.elapsed().as_millis() as u32;
-            let _ = sock.send(&proto::build_heartbeat(session, ms));
+            let _ = link.send(&proto::build_heartbeat(session, ms));
         }
 
         // Zamanı gelen paketleri gönder
         while let Some(Reverse((when, _, _))) = heap.peek() {
             if *when <= Instant::now() {
                 let Reverse((_, _, pkt)) = heap.pop().unwrap();
-                let _ = sock.send(&pkt);
+                let _ = link.send(&pkt);
                 sent += 1;
             } else {
                 break;
-            }
-        }
-
-        // ACK'leri boşalt (RTT ölçümü)
-        while let Ok(n) = sock.recv(&mut rbuf) {
-            if let Some(proto::Packet::HeartbeatAck { session: s, time_ms }) = proto::parse(&rbuf[..n]) {
-                if s == session {
-                    hb_acks += 1;
-                    rtt_sum_ms += t0.elapsed().as_millis() as f64 - time_ms as f64;
-                }
             }
         }
 
@@ -227,10 +311,11 @@ fn cmd_send(a: SendArgs) -> Result<()> {
     }
 
     for _ in 0..3 {
-        let _ = sock.send(&proto::build_bye(session));
+        let _ = link.send(&proto::build_bye(session));
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    let (hb_acks, rtt_sum_ms) = *ack_stats.lock().unwrap();
     println!(
         "bitti: {} çerçeve üretildi, {} gönderildi, {} simüle kayıp (%{:.1}), {} hb-ack, ort. RTT {:.1} ms",
         n_frames,

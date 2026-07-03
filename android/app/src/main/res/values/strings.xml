@@ -11,4 +11,7 @@
     <string name="notif_channel">Mikrofon akışı</string>
     <string name="gain_label">Mikrofon seviyesi: %150</string>
     <string name="noise_suppress">Gürültü azaltma</string>
+    <string name="phone_aec">Yankı eng. (telefon)</string>
+    <string name="usb_mode">USB (kablo) modu — önce PC\'de "USB bağlantısını kur"</string>
+    <string name="soundpad">Soundpad (uzun bas: durdur)</string>
 </resources>

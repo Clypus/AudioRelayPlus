@@ -34,25 +34,62 @@
         android:layout_height="wrap_content"
         android:max="300" />
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <CheckBox
+            android:id="@+id/nsBox"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/noise_suppress" />
+
+        <CheckBox
+            android:id="@+id/aecBox"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/phone_aec" />
+    </LinearLayout>
+
     <CheckBox
-        android:id="@+id/nsBox"
+        android:id="@+id/usbBox"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/noise_suppress" />
+        android:text="@string/usb_mode" />
 
     <Button
         android:id="@+id/scanBtn"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
+        android:layout_marginTop="4dp"
         android:text="@string/scan" />
 
     <ListView
         android:id="@+id/serverList"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_marginTop="8dp"
+        android:layout_marginTop="4dp"
         android:layout_weight="1" />
+
+    <TextView
+        android:id="@+id/padLabel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/soundpad"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
+    <GridView
+        android:id="@+id/padGrid"
+        android:layout_width="match_parent"
+        android:layout_height="130dp"
+        android:horizontalSpacing="6dp"
+        android:numColumns="3"
+        android:verticalSpacing="6dp"
+        android:visibility="gone" />
 
     <EditText
         android:id="@+id/manualIp"

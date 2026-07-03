@@ -16,6 +16,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.GridView
 import android.widget.ListView
 import android.widget.SeekBar
 import android.widget.TextView
@@ -29,6 +30,10 @@ class MainActivity : Activity() {
     private lateinit var serverList: ListView
     private lateinit var manualIp: EditText
     private lateinit var adapter: ArrayAdapter<Discovery.Server>
+    private lateinit var padLabel: TextView
+    private lateinit var padGrid: GridView
+    private lateinit var padAdapter: ArrayAdapter<String>
+    private var padShown: List<String> = emptyList()
     private val servers = ArrayList<Discovery.Server>()
     private val ui = Handler(Looper.getMainLooper())
     private var pendingHost: String? = null
@@ -42,6 +47,17 @@ class MainActivity : Activity() {
                 StreamService.statusText
             } else {
                 idleStatus.ifEmpty { getString(R.string.status_ready) }
+            }
+            // Soundpad listesi PC'den geldiyse/gittiyse ızgarayı güncelle
+            val names = StreamService.soundNames
+            if (names !== padShown) {
+                padShown = names
+                padAdapter.clear()
+                padAdapter.addAll(names)
+                padAdapter.notifyDataSetChanged()
+                val vis = if (names.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
+                padLabel.visibility = vis
+                padGrid.visibility = vis
             }
             ui.postDelayed(this, 500)
         }
@@ -69,10 +85,11 @@ class MainActivity : Activity() {
         scanBtn.setOnClickListener { scan() }
         connectBtn.setOnClickListener {
             val host = manualIp.text.toString().trim()
-            if (host.isEmpty()) {
-                Toast.makeText(this, "IP adresi gir ya da listeden PC seç", Toast.LENGTH_SHORT).show()
-            } else {
-                connect(host, Protocol.DEFAULT_PORT)
+            when {
+                StreamService.usbMode -> connect("127.0.0.1", Protocol.DEFAULT_PORT)
+                host.isEmpty() ->
+                    Toast.makeText(this, "IP adresi gir ya da listeden PC seç", Toast.LENGTH_SHORT).show()
+                else -> connect(host, Protocol.DEFAULT_PORT)
             }
         }
         stopBtn.setOnClickListener {
@@ -109,6 +126,38 @@ class MainActivity : Activity() {
         nsBox.setOnCheckedChangeListener { _, c ->
             StreamService.noiseSuppress = c
             prefs().edit().putBoolean("ns_on", c).apply()
+        }
+
+        // Telefon AEC'si (yeni bağlantıda etkinleşir)
+        val aecBox = findViewById<CheckBox>(R.id.aecBox)
+        StreamService.phoneAec = prefs().getBoolean("aec_on", false)
+        aecBox.isChecked = StreamService.phoneAec
+        aecBox.setOnCheckedChangeListener { _, c ->
+            StreamService.phoneAec = c
+            prefs().edit().putBoolean("aec_on", c).apply()
+        }
+
+        // USB modu
+        val usbBox = findViewById<CheckBox>(R.id.usbBox)
+        StreamService.usbMode = prefs().getBoolean("usb_on", false)
+        usbBox.isChecked = StreamService.usbMode
+        usbBox.setOnCheckedChangeListener { _, c ->
+            StreamService.usbMode = c
+            prefs().edit().putBoolean("usb_on", c).apply()
+        }
+
+        // Soundpad ızgarası (PC'den liste gelince görünür)
+        padLabel = findViewById(R.id.padLabel)
+        padGrid = findViewById(R.id.padGrid)
+        padAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, ArrayList<String>())
+        padGrid.adapter = padAdapter
+        padGrid.setOnItemClickListener { _, _, pos, _ ->
+            StreamService.pendingSound = pos
+        }
+        padGrid.setOnItemLongClickListener { _, _, _, _ ->
+            StreamService.pendingSound = -1
+            Toast.makeText(this, "Sesler durduruldu", Toast.LENGTH_SHORT).show()
+            true
         }
 
         manualIp.setText(prefs().getString("last_host", ""))
@@ -174,8 +223,10 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
             return
         }
-        prefs().edit().putString("last_host", host).apply()
-        manualIp.setText(host)
+        if (host != "127.0.0.1") {
+            prefs().edit().putString("last_host", host).apply()
+            manualIp.setText(host)
+        }
         askBatteryExemption()
         val i = Intent(this, StreamService::class.java)
             .setAction(StreamService.ACTION_CONNECT)

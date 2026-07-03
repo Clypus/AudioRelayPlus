@@ -49,6 +49,10 @@ pub enum Packet<'a> {
     Heartbeat { session: u32, time_ms: u32 },
     HeartbeatAck { session: u32, time_ms: u32 },
     Bye { session: u32 },
+    SoundListReq { session: u32 },
+    SoundList { names: Vec<String> },
+    SoundPlay { session: u32, id: u8 },
+    SoundStop { session: u32 },
 }
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
@@ -94,6 +98,28 @@ pub fn parse(buf: &[u8]) -> Option<Packet<'_>> {
         6 if body.len() >= 8 => Some(Packet::Heartbeat { session: u32_at(body, 0), time_ms: u32_at(body, 4) }),
         7 if body.len() >= 8 => Some(Packet::HeartbeatAck { session: u32_at(body, 0), time_ms: u32_at(body, 4) }),
         8 if body.len() >= 4 => Some(Packet::Bye { session: u32_at(body, 0) }),
+        9 if body.len() >= 4 => Some(Packet::SoundListReq { session: u32_at(body, 0) }),
+        10 if !body.is_empty() => {
+            let count = body[0] as usize;
+            let mut names = Vec::with_capacity(count);
+            let mut off = 1;
+            for _ in 0..count {
+                if body.len() < off + 2 {
+                    return None;
+                }
+                let _id = body[off];
+                let len = body[off + 1] as usize;
+                off += 2;
+                if body.len() < off + len {
+                    return None;
+                }
+                names.push(String::from_utf8_lossy(&body[off..off + len]).into_owned());
+                off += len;
+            }
+            Some(Packet::SoundList { names })
+        }
+        11 if body.len() >= 5 => Some(Packet::SoundPlay { session: u32_at(body, 0), id: body[4] }),
+        12 if body.len() >= 4 => Some(Packet::SoundStop { session: u32_at(body, 0) }),
         _ => None,
     }
 }
@@ -168,6 +194,53 @@ pub fn build_bye(session: u32) -> Vec<u8> {
     v
 }
 
+pub fn build_sound_list_req(session: u32) -> Vec<u8> {
+    let mut v = header(9, 4);
+    v.extend_from_slice(&session.to_be_bytes());
+    v
+}
+
+/// En fazla 32 ad; adlar 40 bayta kırpılır (tek UDP paketine sığsın).
+pub fn build_sound_list(names: &[String]) -> Vec<u8> {
+    let n = names.len().min(32);
+    let mut v = header(10, 1 + n * 42);
+    v.push(n as u8);
+    for (i, name) in names.iter().take(n).enumerate() {
+        let mut b = name.as_bytes();
+        while b.len() > 40 {
+            // UTF-8 sınırında kırp
+            let cut = (0..=40).rev().find(|&c| name.is_char_boundary(c)).unwrap_or(0);
+            b = &name.as_bytes()[..cut];
+            break;
+        }
+        v.push(i as u8);
+        v.push(b.len() as u8);
+        v.extend_from_slice(b);
+    }
+    v
+}
+
+pub fn build_sound_play(session: u32, id: u8) -> Vec<u8> {
+    let mut v = header(11, 5);
+    v.extend_from_slice(&session.to_be_bytes());
+    v.push(id);
+    v
+}
+
+pub fn build_sound_stop(session: u32) -> Vec<u8> {
+    let mut v = header(12, 4);
+    v.extend_from_slice(&session.to_be_bytes());
+    v
+}
+
+/// TCP çerçevesi: [uzunluk u16 BE][paket]. USB (adb) modunda kullanılır.
+pub fn tcp_frame(pkt: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + pkt.len());
+    v.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
+    v.extend_from_slice(pkt);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +266,44 @@ mod tests {
         match parse(&build_discover_reply(5, 48222, "Bilgisayarım")) {
             Some(Packet::DiscoverReply { nonce: 5, port: 48222, name }) => {
                 assert_eq!(name, "Bilgisayarım");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_soundpad_packets() {
+        let names = vec!["harika bir ses".to_string(), "gülüş".to_string()];
+        match parse(&build_sound_list(&names)) {
+            Some(Packet::SoundList { names: got }) => assert_eq!(got, names),
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        match parse(&build_sound_play(7, 3)) {
+            Some(Packet::SoundPlay { session: 7, id: 3 }) => {}
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        match parse(&build_sound_list_req(9)) {
+            Some(Packet::SoundListReq { session: 9 }) => {}
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        match parse(&build_sound_stop(9)) {
+            Some(Packet::SoundStop { session: 9 }) => {}
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        // TCP çerçevesi
+        let pkt = build_sound_play(1, 2);
+        let framed = tcp_frame(&pkt);
+        assert_eq!(u16::from_be_bytes([framed[0], framed[1]]) as usize, pkt.len());
+        assert_eq!(&framed[2..], &pkt[..]);
+    }
+
+    #[test]
+    fn sound_list_truncates_long_names() {
+        let long = "ç".repeat(60); // çok baytlı: kırpma UTF-8 sınırında olmalı
+        match parse(&build_sound_list(&[long])) {
+            Some(Packet::SoundList { names }) => {
+                assert!(names[0].len() <= 40);
+                assert!(names[0].chars().all(|c| c == 'ç'));
             }
             other => panic!("beklenmeyen: {other:?}"),
         }

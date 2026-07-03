@@ -1,18 +1,22 @@
-//! Alıcı motoru: ağ dinleyicisi, oturum yönetimi, ses çekme yolu ve gözetmen.
+//! Alıcı motoru: ağ dinleyicileri (UDP + USB/TCP), oturum yönetimi, ses çekme
+//! yolu (jitter tamponu → AEC → soundpad → kazanç) ve gözetmen.
 //! Hem CLI (arp-receiver) hem GUI (arp-gui) bunun üzerine kuruludur.
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::aec::Aec;
 use crate::decoder::{OpusDec, PcmDec};
 use crate::jitter::{FrameDecoder, JitterBuffer, JitterConfig, JitterStats, State};
 use crate::protocol as proto;
 use crate::resampler::Resampler;
+use crate::soundpad::Soundpad;
 
 pub struct Session {
     pub id: u32,
@@ -30,6 +34,28 @@ pub struct Engine {
 }
 
 pub type Shared = Arc<Mutex<Engine>>;
+
+/// Ses yolunun canlı ayarları: kazanç, yankı iptali, soundpad.
+#[derive(Clone)]
+pub struct AudioCtl {
+    pub gain_bits: Arc<AtomicU32>,
+    pub aec: Arc<Mutex<Option<Aec>>>,
+    pub pad: Arc<Soundpad>,
+}
+
+impl AudioCtl {
+    pub fn new(pad: Arc<Soundpad>) -> AudioCtl {
+        AudioCtl {
+            gain_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            aec: Arc::new(Mutex::new(None)),
+            pad,
+        }
+    }
+
+    pub fn set_gain(&self, g: f32) {
+        self.gain_bits.store(g.to_bits(), Ordering::Relaxed);
+    }
+}
 
 /// Olay günlüğü: GUI son satırları gösterir, CLI isterse stdout'a da basar.
 pub struct EventLog {
@@ -100,100 +126,220 @@ fn make_decoder(codec: proto::Codec) -> Result<Box<dyn FrameDecoder + Send>> {
     })
 }
 
-/// UDP dinleyici iş parçacığını başlatır (keşif + oturum + ses paketleri).
-pub fn spawn_net(sock: UdpSocket, shared: Shared, name: String, target_ms: u32, log: Arc<EventLog>) {
+/// UDP ve TCP'nin ortak paket işleyicisi. `reply` yanıtı kaynağa geri yollar.
+fn handle_packet(
+    pkt: proto::Packet<'_>,
+    src: SocketAddr,
+    reply: &mut dyn FnMut(&[u8]),
+    shared: &Shared,
+    name: &str,
+    udp_port: u16,
+    target_ms: u32,
+    log: &EventLog,
+    pad: &Soundpad,
+) {
+    match pkt {
+        proto::Packet::Discover { nonce } => {
+            log.push(format!("🔎 keşif isteği geldi: {src} — yanıtlandı"));
+            reply(&proto::build_discover_reply(nonce, udp_port, name));
+        }
+        proto::Packet::Hello(h) => {
+            let mut eng = shared.lock().unwrap();
+            let already = matches!(&eng.session, Some(s) if s.id == h.session);
+            if !already {
+                if h.sample_rate != proto::SAMPLE_RATE || h.channels != 1 {
+                    log.push(format!(
+                        "⚠ desteklenmeyen format ({} Hz, {} kanal) — yok sayıldı",
+                        h.sample_rate, h.channels
+                    ));
+                    return;
+                }
+                let dec = match make_decoder(h.codec) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log.push(format!("⚠ çözücü açılamadı: {e}"));
+                        return;
+                    }
+                };
+                let cfg = JitterConfig {
+                    frame_samples: h.codec.frame_samples(),
+                    start_target_ms: target_ms,
+                    ..Default::default()
+                };
+                eng.epoch_counter += 1;
+                let epoch = eng.epoch_counter;
+                eng.session = Some(Session {
+                    id: h.session,
+                    peer: src,
+                    jb: JitterBuffer::new(cfg),
+                    dec,
+                    last_packet: Instant::now(),
+                    epoch,
+                });
+                log.push(format!("📱 bağlandı: {src} (codec={:?}, çerçeve={} ms)", h.codec, h.frame_ms));
+            }
+            drop(eng);
+            reply(&proto::build_hello_ack(h.session));
+        }
+        proto::Packet::Audio { session, seq, payload, .. } => {
+            let mut eng = shared.lock().unwrap();
+            if let Some(s) = eng.session.as_mut() {
+                if s.id == session {
+                    s.jb.push(seq, payload.to_vec());
+                    s.last_packet = Instant::now();
+                    s.peer = src;
+                }
+            }
+        }
+        proto::Packet::Heartbeat { session, time_ms } => {
+            // Yalnızca bilinen oturuma ACK: oturum düştüyse istemci
+            // ACK alamayıp yeniden HELLO göndersin (sessiz kopukluk olmasın).
+            let mut eng = shared.lock().unwrap();
+            let known = match eng.session.as_mut() {
+                Some(s) if s.id == session => {
+                    s.last_packet = Instant::now();
+                    true
+                }
+                _ => false,
+            };
+            drop(eng);
+            if known {
+                reply(&proto::build_heartbeat_ack(session, time_ms));
+            }
+        }
+        proto::Packet::Bye { session } => {
+            let mut eng = shared.lock().unwrap();
+            if matches!(&eng.session, Some(s) if s.id == session) {
+                eng.session = None;
+                log.push("👋 istemci ayrıldı".into());
+            }
+        }
+        proto::Packet::SoundListReq { session } => {
+            let eng = shared.lock().unwrap();
+            let ok = matches!(&eng.session, Some(s) if s.id == session);
+            drop(eng);
+            if ok {
+                reply(&proto::build_sound_list(&pad.names()));
+            }
+        }
+        proto::Packet::SoundPlay { session, id } => {
+            let eng = shared.lock().unwrap();
+            let ok = matches!(&eng.session, Some(s) if s.id == session);
+            drop(eng);
+            if ok {
+                pad.play(id as usize);
+                log.push(format!("🔔 soundpad (telefondan): #{id}"));
+            }
+        }
+        proto::Packet::SoundStop { session } => {
+            let eng = shared.lock().unwrap();
+            let ok = matches!(&eng.session, Some(s) if s.id == session);
+            drop(eng);
+            if ok {
+                pad.stop_all();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// UDP dinleyicisi (Wi-Fi yolu).
+pub fn spawn_net(
+    sock: UdpSocket,
+    shared: Shared,
+    name: String,
+    target_ms: u32,
+    log: Arc<EventLog>,
+    pad: Arc<Soundpad>,
+) {
     std::thread::spawn(move || {
+        let udp_port = sock.local_addr().map(|a| a.port()).unwrap_or(proto::DEFAULT_PORT);
         let mut buf = [0u8; 2048];
         loop {
             let (n, src) = match sock.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let pkt = match proto::parse(&buf[..n]) {
-                Some(p) => p,
-                None => continue,
-            };
-            match pkt {
-                proto::Packet::Discover { nonce } => {
-                    log.push(format!("🔎 keşif isteği geldi: {src} — yanıtlandı"));
-                    let port = sock.local_addr().map(|a| a.port()).unwrap_or(proto::DEFAULT_PORT);
-                    let _ = sock.send_to(&proto::build_discover_reply(nonce, port, &name), src);
-                }
-                proto::Packet::Hello(h) => {
-                    let mut eng = shared.lock().unwrap();
-                    let already = matches!(&eng.session, Some(s) if s.id == h.session);
-                    if !already {
-                        if h.sample_rate != proto::SAMPLE_RATE || h.channels != 1 {
-                            log.push(format!(
-                                "⚠ desteklenmeyen format ({} Hz, {} kanal) — yok sayıldı",
-                                h.sample_rate, h.channels
-                            ));
-                            continue;
-                        }
-                        let dec = match make_decoder(h.codec) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                log.push(format!("⚠ çözücü açılamadı: {e}"));
-                                continue;
-                            }
-                        };
-                        let cfg = JitterConfig {
-                            frame_samples: h.codec.frame_samples(),
-                            start_target_ms: target_ms,
-                            ..Default::default()
-                        };
-                        eng.epoch_counter += 1;
-                        let epoch = eng.epoch_counter;
-                        eng.session = Some(Session {
-                            id: h.session,
-                            peer: src,
-                            jb: JitterBuffer::new(cfg),
-                            dec,
-                            last_packet: Instant::now(),
-                            epoch,
-                        });
-                        log.push(format!("📱 bağlandı: {src} (codec={:?}, çerçeve={} ms)", h.codec, h.frame_ms));
-                    }
-                    drop(eng);
-                    let _ = sock.send_to(&proto::build_hello_ack(h.session), src);
-                }
-                proto::Packet::Audio { session, seq, payload, .. } => {
-                    let mut eng = shared.lock().unwrap();
-                    if let Some(s) = eng.session.as_mut() {
-                        if s.id == session {
-                            s.jb.push(seq, payload.to_vec());
-                            s.last_packet = Instant::now();
-                            s.peer = src;
-                        }
-                    }
-                }
-                proto::Packet::Heartbeat { session, time_ms } => {
-                    // Yalnızca bilinen oturuma ACK: oturum düştüyse istemci
-                    // ACK alamayıp yeniden HELLO göndersin (sessiz kopukluk olmasın).
-                    let mut eng = shared.lock().unwrap();
-                    let known = match eng.session.as_mut() {
-                        Some(s) if s.id == session => {
-                            s.last_packet = Instant::now();
-                            true
-                        }
-                        _ => false,
-                    };
-                    drop(eng);
-                    if known {
-                        let _ = sock.send_to(&proto::build_heartbeat_ack(session, time_ms), src);
-                    }
-                }
-                proto::Packet::Bye { session } => {
-                    let mut eng = shared.lock().unwrap();
-                    if matches!(&eng.session, Some(s) if s.id == session) {
-                        eng.session = None;
-                        log.push("👋 istemci ayrıldı".into());
-                    }
-                }
-                _ => {}
+            if let Some(pkt) = proto::parse(&buf[..n]) {
+                let mut reply = |b: &[u8]| {
+                    let _ = sock.send_to(b, src);
+                };
+                handle_packet(pkt, src, &mut reply, &shared, &name, udp_port, target_ms, &log, &pad);
             }
         }
     });
+}
+
+/// USB/TCP dinleyicisi: `adb reverse tcp:48222 tcp:48222` ile telefon
+/// 127.0.0.1'e bağlanır. Çerçeve: [uzunluk u16 BE][paket].
+pub fn spawn_tcp(
+    port: u16,
+    shared: Shared,
+    name: String,
+    target_ms: u32,
+    log: Arc<EventLog>,
+    pad: Arc<Soundpad>,
+) -> Result<()> {
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .with_context(|| format!("TCP {port} portu açılamadı"))?;
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let shared = shared.clone();
+            let name = name.clone();
+            let log = log.clone();
+            let pad = pad.clone();
+            std::thread::spawn(move || {
+                let peer = match stream.peer_addr() {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let _ = stream.set_nodelay(true);
+                let mut writer = match stream.try_clone() {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                log.push(format!("🔌 USB/TCP bağlantısı: {peer}"));
+                let mut reader = stream;
+                let mut hdr = [0u8; 2];
+                let mut body = vec![0u8; 4096];
+                let mut last_session: Option<u32> = None;
+                loop {
+                    if reader.read_exact(&mut hdr).is_err() {
+                        break;
+                    }
+                    let len = u16::from_be_bytes(hdr) as usize;
+                    if len == 0 || len > body.len() {
+                        break;
+                    }
+                    if reader.read_exact(&mut body[..len]).is_err() {
+                        break;
+                    }
+                    if let Some(pkt) = proto::parse(&body[..len]) {
+                        if let proto::Packet::Hello(h) = &pkt {
+                            last_session = Some(h.session);
+                        }
+                        let mut reply = |b: &[u8]| {
+                            let _ = writer.write_all(&proto::tcp_frame(b));
+                        };
+                        handle_packet(pkt, peer, &mut reply, &shared, &name, port, target_ms, &log, &pad);
+                    }
+                }
+                // Bağlantı koptu: bu bağlantının oturumu aktifse kapat
+                if let Some(sid) = last_session {
+                    let mut eng = shared.lock().unwrap();
+                    if matches!(&eng.session, Some(s) if s.id == sid) {
+                        eng.session = None;
+                        log.push("🔌 USB/TCP bağlantısı kapandı".into());
+                    }
+                }
+            });
+        }
+    });
+    Ok(())
 }
 
 /// Gözetmen: saniyede bir oturum zaman aşımı + saat kayması servosu
@@ -245,16 +391,20 @@ pub fn spawn_supervisor(shared: Shared, adj: Arc<AtomicI32>, log: Arc<EventLog>,
     });
 }
 
-/// Ortak tüketim yolu: oturumdan mono 48 kHz örnek çek (yoksa sessizlik).
+/// Ortak tüketim yolu: 48 kHz mono zincir = jitter tamponu → AEC → soundpad,
+/// sonra cihaz hızına dönüşüm + kazanç. Oturum yokken de soundpad çalar.
 pub fn pull_mono(
     shared: &Shared,
     rs: &mut Resampler,
     last_epoch: &mut u64,
     adj_ppm: &AtomicI32,
-    gain: f32,
+    ctl: &AudioCtl,
     out: &mut [f32],
 ) {
+    let gain = f32::from_bits(ctl.gain_bits.load(Ordering::Relaxed));
     let mut eng = shared.lock().unwrap();
+    let mut aec_guard = ctl.aec.lock().unwrap();
+    let pad = &ctl.pad;
     match eng.session.as_mut() {
         Some(s) => {
             if s.epoch != *last_epoch {
@@ -266,16 +416,29 @@ pub fn pull_mono(
             let dec = s.dec.as_mut();
             rs.process(out, |buf| {
                 jb.pull(buf, dec);
-            });
-            if gain != 1.0 {
-                for s in out.iter_mut() {
-                    // kübik soft-clip: sert kırpma yerine düzgün doyma
-                    let x = (*s * gain).clamp(-1.5, 1.5);
-                    *s = x - x * x * x / 6.75;
+                if let Some(a) = aec_guard.as_mut() {
+                    a.process(buf);
                 }
-            }
+                pad.mix_into(buf);
+            });
         }
-        None => out.fill(0.0),
+        None => {
+            rs.set_adj_ppm(0.0);
+            rs.process(out, |buf| {
+                buf.fill(0.0);
+                if let Some(a) = aec_guard.as_mut() {
+                    a.process(buf);
+                }
+                pad.mix_into(buf);
+            });
+        }
+    }
+    if gain != 1.0 {
+        for s in out.iter_mut() {
+            // kübik soft-clip: sert kırpma yerine düzgün doyma
+            let x = (*s * gain).clamp(-1.5, 1.5);
+            *s = x - x * x * x / 6.75;
+        }
     }
 }
 
@@ -310,7 +473,7 @@ fn build_stream<T>(
     config: &cpal::StreamConfig,
     shared: Shared,
     adj_ppm: Arc<AtomicI32>,
-    gain_bits: Arc<AtomicU32>,
+    ctl: AudioCtl,
 ) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -324,8 +487,7 @@ where
         move |data: &mut [T], _| {
             let frames = data.len() / channels;
             mono.resize(frames, 0.0);
-            let gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
-            pull_mono(&shared, &mut rs, &mut last_epoch, &adj_ppm, gain, &mut mono);
+            pull_mono(&shared, &mut rs, &mut last_epoch, &adj_ppm, &ctl, &mut mono);
             for (i, frame) in data.chunks_mut(channels).enumerate() {
                 let v = T::from_sample(mono[i]);
                 for ch in frame.iter_mut() {
@@ -339,12 +501,12 @@ where
     Ok(stream)
 }
 
-/// Ses çıkış akışını kurar; (akış, açıklama) döner. `gain_bits` canlı değiştirilebilir.
+/// Ses çıkış akışını kurar; (akış, açıklama) döner.
 pub fn run_audio(
     shared: Shared,
     adj_ppm: Arc<AtomicI32>,
     want: &Option<String>,
-    gain_bits: Arc<AtomicU32>,
+    ctl: AudioCtl,
 ) -> Result<(cpal::Stream, String)> {
     let host = cpal::default_host();
     let device = pick_device(&host, want)?;
@@ -371,9 +533,9 @@ pub fn run_audio(
         config.channels
     );
     let stream = match chosen.sample_format() {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, shared, adj_ppm, gain_bits)?,
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, shared, adj_ppm, gain_bits)?,
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, shared, adj_ppm, gain_bits)?,
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, shared, adj_ppm, ctl)?,
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, shared, adj_ppm, ctl)?,
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, shared, adj_ppm, ctl)?,
         f => return Err(anyhow!("desteklenmeyen örnek formatı: {f:?}")),
     };
     stream.play()?;

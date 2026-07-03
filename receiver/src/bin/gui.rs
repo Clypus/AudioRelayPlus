@@ -1,17 +1,18 @@
 //! arp-gui — AudioRelayPlus alıcısının pencereli sürümü (Windows + Linux).
 //!
-//! Çift tıkla aç, telefondan bağlan; durum, aygıt seçimi, kazanç ve
-//! (Linux'ta) tek tıkla sanal mikrofon burada.
+//! Çift tıkla aç, telefondan bağlan; durum, aygıt seçimi, kazanç, soundpad,
+//! yankı iptali ve (Linux'ta) tek tıkla sanal mikrofon burada.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use eframe::egui;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
-use arp::engine::{self, Engine, EventLog, Shared};
+use arp::engine::{self, AudioCtl, Engine, EventLog, Shared};
 use arp::protocol as proto;
+use arp::soundpad::Soundpad;
 
 const VIRT_SINK: &str = "arp_sink";
 const VIRT_SOURCE: &str = "arp_mic";
@@ -20,8 +21,8 @@ const VIRT_DESC: &str = "AudioRelayPlus Mic";
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 560.0])
-            .with_min_inner_size([380.0, 420.0]),
+            .with_inner_size([480.0, 640.0])
+            .with_min_inner_size([400.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -90,13 +91,23 @@ impl Drop for VirtualMic {
     }
 }
 
+fn adb_available() -> bool {
+    std::process::Command::new("adb")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 struct App {
     shared: Shared,
     adj: Arc<AtomicI32>,
     log: Arc<EventLog>,
-    gain_bits: Arc<AtomicU32>,
+    ctl: AudioCtl,
     gain: f32,
-    stream: Option<cpal_stream::StreamHolder>,
+    stream: Option<cpal::Stream>,
+    loopback: Option<cpal::Stream>,
+    aec_enabled: bool,
     out_desc: String,
     devices: Vec<String>,
     selected_device: Option<String>,
@@ -104,11 +115,8 @@ struct App {
     virtual_mic: Option<VirtualMic>,
     net_ok: bool,
     error: Option<String>,
-}
-
-/// cpal::Stream'i tutmak için ince sarmalayıcı (drop = akışı kapat).
-mod cpal_stream {
-    pub struct StreamHolder(pub cpal::Stream);
+    adb_found: bool,
+    pad_names: Vec<String>,
 }
 
 impl App {
@@ -116,20 +124,43 @@ impl App {
         let shared: Shared = Arc::new(Mutex::new(Engine::default()));
         let adj = Arc::new(AtomicI32::new(0));
         let log = EventLog::new(false);
-        let gain_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+
+        // Soundpad: exe'nin yanındaki ya da çalışma dizinindeki "soundpad" klasörü
+        let pad_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("soundpad")))
+            .filter(|d| d.is_dir())
+            .or_else(|| {
+                let d = std::path::PathBuf::from("soundpad");
+                if d.is_dir() {
+                    Some(d)
+                } else {
+                    None
+                }
+            });
+        let pad = Arc::new(match &pad_dir {
+            Some(d) => Soundpad::load_dir(d, &log),
+            None => Soundpad::empty(),
+        });
+        let pad_names = pad.names();
+        let ctl = AudioCtl::new(pad.clone());
 
         let mut net_ok = false;
         let mut error = None;
         match UdpSocket::bind(("0.0.0.0", proto::DEFAULT_PORT)) {
             Ok(sock) => {
-                engine::spawn_net(sock, shared.clone(), engine::default_name(), 80, log.clone());
+                let name = engine::default_name();
+                engine::spawn_net(sock, shared.clone(), name.clone(), 60, log.clone(), pad.clone());
+                if let Err(e) = engine::spawn_tcp(proto::DEFAULT_PORT, shared.clone(), name, 60, log.clone(), pad.clone()) {
+                    log.push(format!("⚠ USB/TCP dinleyicisi açılamadı: {e}"));
+                }
                 engine::spawn_supervisor(shared.clone(), adj.clone(), log.clone(), false);
-                log.push(format!("🎧 UDP {} dinleniyor — telefondan bağlanabilirsiniz", proto::DEFAULT_PORT));
+                log.push(format!("🎧 UDP+TCP {} dinleniyor — telefondan bağlanabilirsiniz", proto::DEFAULT_PORT));
                 net_ok = true;
             }
             Err(e) => {
                 error = Some(format!(
-                    "UDP {} açılamadı: {e}\nBaşka bir arp-receiver açık olabilir.",
+                    "Port {} açılamadı: {e}\nBaşka bir arp-receiver/arp-gui açık olabilir.",
                     proto::DEFAULT_PORT
                 ));
             }
@@ -139,9 +170,11 @@ impl App {
             shared,
             adj,
             log,
-            gain_bits,
+            ctl,
             gain: 1.0,
             stream: None,
+            loopback: None,
+            aec_enabled: false,
             out_desc: String::new(),
             devices: engine::list_output_devices(),
             selected_device: None,
@@ -149,6 +182,8 @@ impl App {
             virtual_mic: None,
             net_ok,
             error,
+            adb_found: adb_available(),
+            pad_names,
         };
         if app.net_ok {
             app.apply_output();
@@ -177,21 +212,52 @@ impl App {
             }
         }
 
-        match engine::run_audio(
-            self.shared.clone(),
-            self.adj.clone(),
-            &self.selected_device,
-            self.gain_bits.clone(),
-        ) {
+        match engine::run_audio(self.shared.clone(), self.adj.clone(), &self.selected_device, self.ctl.clone()) {
             Ok((stream, desc)) => {
                 self.out_desc = desc.clone();
-                self.stream = Some(cpal_stream::StreamHolder(stream));
+                self.stream = Some(stream);
                 self.log.push(format!("🔊 çıkış: {desc}"));
             }
             Err(e) => {
                 self.out_desc = String::new();
                 self.log.push(format!("⚠ ses çıkışı açılamadı: {e}"));
             }
+        }
+    }
+
+    fn toggle_aec(&mut self) {
+        if self.aec_enabled {
+            match arp::aec::spawn_loopback_reference(&self.log) {
+                Ok((stream, ring)) => {
+                    *self.ctl.aec.lock().unwrap() = Some(arp::aec::Aec::new(ring));
+                    self.loopback = Some(stream);
+                    self.log.push("🔇 yankı iptali etkin (deneysel)".into());
+                }
+                Err(e) => {
+                    self.log.push(format!("⚠ yankı iptali açılamadı: {e}"));
+                    self.aec_enabled = false;
+                }
+            }
+        } else {
+            *self.ctl.aec.lock().unwrap() = None;
+            self.loopback = None;
+            self.log.push("yankı iptali kapatıldı".into());
+        }
+    }
+
+    fn setup_usb(&mut self) {
+        let out = std::process::Command::new("adb")
+            .args(["reverse", "tcp:48222", "tcp:48222"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                self.log.push("🔌 USB hazır: telefonda \"USB modu\"nu açıp bağlanın".into());
+            }
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                self.log.push(format!("⚠ adb reverse başarısız: {}", err.trim()));
+            }
+            Err(e) => self.log.push(format!("⚠ adb çalıştırılamadı: {e}")),
         }
     }
 }
@@ -211,13 +277,13 @@ impl eframe::App for App {
             let snap = engine::snapshot(&self.shared);
             match &snap {
                 Some(s) => {
-                    let (dot, renk) = if s.playing {
-                        ("●", egui::Color32::from_rgb(80, 200, 100))
+                    let renk = if s.playing {
+                        egui::Color32::from_rgb(80, 200, 100)
                     } else {
-                        ("●", egui::Color32::YELLOW)
+                        egui::Color32::YELLOW
                     };
                     ui.horizontal(|ui| {
-                        ui.colored_label(renk, dot);
+                        ui.colored_label(renk, "●");
                         ui.label(format!("Bağlı: {}", s.peer));
                     });
                     ui.label(format!(
@@ -233,7 +299,7 @@ impl eframe::App for App {
                 }
             }
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.separator();
 
             // Çıkış / sanal mikrofon
@@ -250,7 +316,7 @@ impl eframe::App for App {
             }
             #[cfg(target_os = "windows")]
             {
-                ui.label("Discord/oyunda kullanmak için: VB-Cable kurun, aşağıdan \"CABLE Input\" seçin,");
+                ui.label("Discord/oyun için: VB-Cable kurun, aşağıdan \"CABLE Input\" seçin,");
                 ui.label("Discord'da mikrofon olarak \"CABLE Output\" seçin.");
             }
 
@@ -289,19 +355,75 @@ impl eframe::App for App {
                 ui.label(egui::RichText::new(format!("aktif çıkış: {}", self.out_desc)).weak());
             }
 
-            // Kazanç
-            ui.add_space(6.0);
+            // Kazanç + yankı iptali
+            ui.add_space(4.0);
             let slider = egui::Slider::new(&mut self.gain, 1.0..=4.0)
                 .text("PC tarafı kazanç")
                 .custom_formatter(|v, _| format!("×{v:.1}"));
             if ui.add(slider).changed() {
-                self.gain_bits.store(self.gain.to_bits(), Ordering::Relaxed);
+                self.ctl.set_gain(self.gain);
+            }
+            let before_aec = self.aec_enabled;
+            ui.checkbox(&mut self.aec_enabled, "Yankı engelleme (deneysel) — kesin çözüm: kulaklık");
+            if before_aec != self.aec_enabled {
+                self.toggle_aec();
             }
 
-            ui.add_space(8.0);
+            // USB
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("USB (kablo) modu:").strong());
+                if self.adb_found {
+                    if ui.button("USB bağlantısını kur").clicked() {
+                        self.setup_usb();
+                    }
+                } else {
+                    ui.label("adb bulunamadı — platform-tools kurulumu gerekir");
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Kablo tak → telefonda USB hata ayıklama açık olsun → düğmeye bas → uygulamada \"USB modu\"nu aç.",
+                )
+                .weak()
+                .size(11.5),
+            );
+
+            // Soundpad
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Soundpad").strong());
+                if !self.pad_names.is_empty() && ui.button("⏹ durdur").clicked() {
+                    self.ctl.pad.stop_all();
+                }
+            });
+            if self.pad_names.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Programın yanına \"soundpad\" klasörü açıp içine mp3/ogg/wav/flac atın (yeniden başlatınca yüklenir). Telefondan da çalınabilir.",
+                    )
+                    .weak()
+                    .size(11.5),
+                );
+            } else {
+                egui::ScrollArea::vertical().max_height(120.0).id_salt("padscroll").show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, name) in self.pad_names.clone().iter().enumerate() {
+                            if ui.button(format!("🔔 {name}")).clicked() {
+                                self.ctl.pad.play(i);
+                            }
+                        }
+                    });
+                });
+            }
+
+            // Olay günlüğü
+            ui.add_space(6.0);
             ui.separator();
             ui.label(egui::RichText::new("Olaylar").strong());
-            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+            egui::ScrollArea::vertical().stick_to_bottom(true).id_salt("logscroll").show(ui, |ui| {
                 for line in self.log.tail(50) {
                     ui.label(egui::RichText::new(line).monospace().size(12.0));
                 }

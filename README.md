@@ -103,9 +103,18 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
+## v0.3.0 ile gelenler
+
+- **USB (kablo) modu**: `adb reverse` üzerinden TCP — Wi-Fi'sız, kayıpsız,
+  tampon 30 ms tabana iner ("ani" mod). GUI'de tek düğme + telefonda tek kutu.
+- **Soundpad**: alıcının yanındaki `soundpad/` klasöründen mp3/ogg/wav/flac;
+  GUI düğmeleri + telefondan uzaktan çalma (uzun basma = durdur).
+- **Yankı engelleme (deneysel)**: PC, hoparlörde çalanı referans alıp telefondan
+  dönen yankıyı speex AEC ile bastırır (kesin çözüm: kulaklık).
+- Opus 128 kb/s + düşük gecikme profili (hedef 60 ms, taban 30 ms).
+
 ## Bilinenler / yol haritası
 
 - v1 şifrelemesiz (LAN varsayımı). v2: PIN eşleştirmeli uçtan uca şifreleme.
-- USB modu (adb port yönlendirme ile Wi-Fi'sız akış) planlandı; protokol hazır.
 - PCM16 codec'i yalnız çok temiz ağ/USB için (FEC yok); varsayılan Opus'ta kalın.
 - Alıcı tek istemcilidir; yeni HELLO eskisini devralır.

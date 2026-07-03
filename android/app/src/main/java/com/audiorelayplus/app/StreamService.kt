@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -19,9 +20,12 @@ import android.os.PowerManager
 import android.os.SystemClock
 import io.github.jaredmdobson.concentus.OpusApplication
 import io.github.jaredmdobson.concentus.OpusEncoder
+import java.io.DataInputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.security.SecureRandom
 import kotlin.concurrent.thread
 
@@ -33,6 +37,8 @@ import kotlin.concurrent.thread
  *  - PARTIAL_WAKE_LOCK → CPU uyumaz
  *  - WifiLock (LOW_LATENCY / HIGH_PERF) → Wi-Fi güç tasarrufu gecikmeleri kapanır
  *  - Kalp atışı + izleyici → kopunca kullanıcıya sormadan yeniden bağlanır
+ *
+ * Taşıma: Wi-Fi'da UDP; USB modunda TCP (adb reverse ile 127.0.0.1).
  */
 class StreamService : Service() {
 
@@ -54,12 +60,89 @@ class StreamService : Service() {
 
         /** Donanım gürültü azaltma (varsa). Bağlantı başında uygulanır. */
         @Volatile var noiseSuppress = true
+
+        /** USB (kablo) modu: adb reverse üzerinden TCP. Bağlanırken okunur. */
+        @Volatile var usbMode = false
+
+        /** Telefon AEC'si: VOICE_COMMUNICATION + AcousticEchoCanceler (yeni bağlantıda). */
+        @Volatile var phoneAec = false
+
+        /** PC'den gelen soundpad listesi (Activity düğme yapar). */
+        @Volatile var soundNames: List<String> = emptyList()
+
+        /** -2 = yok, -1 = tümünü durdur, >=0 = çal. Streamer işleyip -2 yapar. */
+        @Volatile var pendingSound = -2
+    }
+
+    /** Taşıma soyutlaması: UDP datagramı ya da TCP çerçevesi. */
+    private interface Link {
+        fun send(pkt: ByteArray)
+        fun recv(buf: ByteArray): Int
+        fun close()
+    }
+
+    private class UdpLink(host: String, port: Int) : Link {
+        private val sock = DatagramSocket().also {
+            it.connect(InetAddress.getByName(host), port)
+        }
+
+        override fun send(pkt: ByteArray) {
+            sock.send(DatagramPacket(pkt, pkt.size))
+        }
+
+        override fun recv(buf: ByteArray): Int {
+            val p = DatagramPacket(buf, buf.size)
+            sock.receive(p)
+            return p.length
+        }
+
+        override fun close() {
+            try {
+                sock.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private class TcpLink(host: String, port: Int) : Link {
+        private val sock = Socket()
+        private val out: java.io.OutputStream
+        private val inp: DataInputStream
+
+        init {
+            sock.tcpNoDelay = true
+            sock.connect(InetSocketAddress(host, port), 2000)
+            out = sock.getOutputStream()
+            inp = DataInputStream(sock.getInputStream())
+        }
+
+        override fun send(pkt: ByteArray) {
+            synchronized(out) {
+                out.write(Protocol.tcpFrame(pkt))
+            }
+        }
+
+        override fun recv(buf: ByteArray): Int {
+            val len = inp.readUnsignedShort()
+            if (len > buf.size) {
+                inp.skipBytes(len)
+                return 0
+            }
+            inp.readFully(buf, 0, len)
+            return len
+        }
+
+        override fun close() {
+            try {
+                sock.close()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     @Volatile private var stopFlag = false
     private var worker: Thread? = null
-    private var receiver: Thread? = null
-    private var socket: DatagramSocket? = null
+    @Volatile private var activeLink: Link? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     @Volatile private var lastAckMs = 0L
@@ -83,6 +166,8 @@ class StreamService : Service() {
         if (running) stopWorkers()
         stopFlag = false
         running = true
+        soundNames = emptyList()
+        pendingSound = -2
 
         createChannel()
         val notif = buildNotification("bağlanıyor: $host …")
@@ -120,61 +205,26 @@ class StreamService : Service() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
         val session = SecureRandom().nextInt()
         val frame = Protocol.OPUS_FRAME_SAMPLES
+        val usb = usbMode
+        val target = if (usb) "USB" else host
 
-        val sock: DatagramSocket
-        try {
-            sock = DatagramSocket()
-            sock.connect(InetAddress.getByName(host), port)
-        } catch (e: Exception) {
-            setStatus("ağ hatası: ${e.message} ❌")
-            shutdown()
-            return
-        }
-        socket = sock
-
-        val t0 = SystemClock.elapsedRealtime()
-        lastAckMs = 0L
-
-        // ACK dinleyicisi: HELLO_ACK ve HEARTBEAT_ACK canlılık kanıtıdır.
-        receiver = thread(name = "arp-acks") {
-            val rb = ByteArray(512)
-            while (!stopFlag) {
-                try {
-                    val p = DatagramPacket(rb, rb.size)
-                    sock.receive(p)
-                    val parsed = Protocol.parse(rb, p.length) ?: continue
-                    when (parsed.type) {
-                        Protocol.T_HELLO_ACK ->
-                            if (parsed.body.int == session) lastAckMs = SystemClock.elapsedRealtime()
-                        Protocol.T_HEARTBEAT_ACK -> {
-                            val b = parsed.body
-                            if (b.remaining() >= 8 && b.int == session) {
-                                val sentAt = b.int
-                                val now = SystemClock.elapsedRealtime()
-                                lastAckMs = now
-                                rttMs = (now - t0 - sentAt).coerceAtLeast(0)
-                            }
-                        }
-                    }
-                } catch (_: Exception) {
-                    // socket kapandıysa stopFlag ile çıkılır
-                }
-            }
-        }
-
+        // Mikrofon + kodlayıcı bağlantı kopsa da yaşar: zamanlama hiç bozulmaz.
         val minBuf = AudioRecord.getMinBufferSize(
             Protocol.SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        val source = if (phoneAec) {
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        } else {
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        }
         val rec: AudioRecord
         try {
             @Suppress("MissingPermission") // izin Activity'de alınmadan servis başlatılmıyor
             rec = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                source,
                 Protocol.SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
-                // Bol tampon: zamanlama takılmalarında örnek kaybolmaz
-                // (eager okuduğumuz için gecikme eklemez).
                 maxOf(minBuf, frame * 2 * 8)
             )
         } catch (e: Exception) {
@@ -187,8 +237,6 @@ class StreamService : Service() {
             shutdown()
             return
         }
-
-        // Donanım gürültü azaltma (cihaz destekliyorsa)
         var ns: NoiseSuppressor? = null
         if (noiseSuppress && NoiseSuppressor.isAvailable()) {
             try {
@@ -196,13 +244,20 @@ class StreamService : Service() {
             } catch (_: Exception) {
             }
         }
+        var aec: AcousticEchoCanceler? = null
+        if (phoneAec && AcousticEchoCanceler.isAvailable()) {
+            try {
+                aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
+            } catch (_: Exception) {
+            }
+        }
 
         val enc: OpusEncoder
         try {
             enc = OpusEncoder(Protocol.SAMPLE_RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP)
-            enc.bitrate = 96000          // mono konuşma için şeffafa yakın
-            enc.useInbandFEC = true      // kayıp paketin yedeği sonraki pakette taşınır
-            enc.packetLossPercent = 20
+            enc.bitrate = 128000       // "pür" ayarı: mono konuşma için şeffaf
+            enc.useInbandFEC = true    // kayıp paketin yedeği sonraki pakette taşınır
+            enc.packetLossPercent = if (usb) 0 else 20
             enc.complexity = 8
         } catch (e: Exception) {
             setStatus("opus hatası: ${e.message} ❌")
@@ -217,79 +272,156 @@ class StreamService : Service() {
         val pcm = ShortArray(frame)
         val encBuf = ByteArray(1500)
         var seq = 0
-        var connected = false
-        var lastHello = 0L
-        var lastHb = 0L
+        val t0 = SystemClock.elapsedRealtime()
 
-        fun trySend(bytes: ByteArray) {
-            try {
-                sock.send(DatagramPacket(bytes, bytes.size))
-            } catch (_: Exception) {
-            }
-        }
-
+        // Dış döngü: bağlantı (link) kur → koparsa yeniden kur. Mikrofon durmaz.
         while (!stopFlag) {
-            val now = SystemClock.elapsedRealtime()
-
-            // Canlılık: 3 sn ACK yoksa kopuk say, saniyede bir HELLO ile kapıyı çal.
-            val alive = lastAckMs != 0L && now - lastAckMs < 3000
-            if (!alive) {
-                if (connected) {
-                    connected = false
-                    setStatus("bağlantı koptu — yeniden deneniyor…")
+            val link: Link = try {
+                if (usb) TcpLink("127.0.0.1", Protocol.DEFAULT_PORT) else UdpLink(host, port)
+            } catch (e: Exception) {
+                setStatus(
+                    if (usb) "USB bağlantısı yok — PC'de \"USB bağlantısını kur\"a basıldı mı?"
+                    else "ağ hatası: ${e.message}"
+                )
+                // beklerken mikrofonu boşalt (birikme olmasın)
+                val until = SystemClock.elapsedRealtime() + 1000
+                while (SystemClock.elapsedRealtime() < until && !stopFlag) {
+                    rec.read(pcm, 0, frame)
                 }
-                if (now - lastHello >= 1000) {
-                    lastHello = now
-                    trySend(hello)
-                }
-            } else if (!connected) {
-                connected = true
-                setStatus("bağlı ✓ $host")
-            }
-
-            if (now - lastHb >= 500) {
-                lastHb = now
-                trySend(Protocol.heartbeat(session, (now - t0).toInt()))
-            }
-
-            // Mikrofonu OKUMAYA HER ZAMAN devam et: kopuklukta bile zamanlama
-            // bozulmaz, ağ dönünce ses anında akar.
-            var got = 0
-            while (got < frame && !stopFlag) {
-                val r = rec.read(pcm, got, frame - got)
-                if (r <= 0) break
-                got += r
-            }
-            if (got < frame) continue
-
-            if (muted) pcm.fill(0)
-
-            // Kazanç + yumuşak sınırlayıcı (kübik soft-clip: |s|≤1.5 → düzgün 1.0'a yaslanır)
-            val g = gainPercent / 100f
-            if (g != 1f && !muted) {
-                for (i in 0 until frame) {
-                    var s = (pcm[i] * g / 32768f).coerceIn(-1.5f, 1.5f)
-                    s -= s * s * s / 6.75f
-                    pcm[i] = (s * 32767f).toInt().toShort()
-                }
-            }
-
-            val n = try {
-                enc.encode(pcm, 0, frame, encBuf, 0, encBuf.size)
-            } catch (_: Exception) {
                 continue
             }
-            trySend(Protocol.audio(session, seq, seq * frame, encBuf, n))
-            seq++
+            activeLink = link
+            lastAckMs = 0L
+            var linkDead = false
+
+            val recvThread = thread(name = "arp-acks") {
+                val rb = ByteArray(2048)
+                while (!stopFlag && !linkDead) {
+                    try {
+                        val n = link.recv(rb)
+                        if (n <= 0) continue
+                        val parsed = Protocol.parse(rb, n) ?: continue
+                        when (parsed.type) {
+                            Protocol.T_HELLO_ACK ->
+                                if (parsed.body.int == session) lastAckMs = SystemClock.elapsedRealtime()
+                            Protocol.T_HEARTBEAT_ACK -> {
+                                val b = parsed.body
+                                if (b.remaining() >= 8 && b.int == session) {
+                                    val sentAt = b.int
+                                    val now = SystemClock.elapsedRealtime()
+                                    lastAckMs = now
+                                    rttMs = (now - t0 - sentAt).coerceAtLeast(0)
+                                }
+                            }
+                            Protocol.T_SOUND_LIST -> {
+                                soundNames = Protocol.parseSoundList(parsed.body)
+                            }
+                        }
+                    } catch (_: Exception) {
+                        break // bağlantı kapandı (stopFlag ya da kopma)
+                    }
+                }
+            }
+
+            var connected = false
+            var lastHello = 0L
+            var lastHb = 0L
+            val linkStart = SystemClock.elapsedRealtime()
+
+            fun trySend(bytes: ByteArray) {
+                try {
+                    link.send(bytes)
+                } catch (_: Exception) {
+                    linkDead = true
+                }
+            }
+
+            while (!stopFlag && !linkDead) {
+                val now = SystemClock.elapsedRealtime()
+
+                // Canlılık: 3 sn ACK yoksa kopuk say, saniyede bir HELLO ile kapıyı çal.
+                val alive = lastAckMs != 0L && now - lastAckMs < 3000
+                if (!alive) {
+                    if (connected) {
+                        connected = false
+                        setStatus("bağlantı koptu — yeniden deneniyor…")
+                    }
+                    if (now - lastHello >= 1000) {
+                        lastHello = now
+                        trySend(hello)
+                    }
+                    // USB'de TCP kurulu ama ACK gelmiyorsa bağlantıyı tazele
+                    if (usb && now - maxOf(lastAckMs, linkStart) > 5000) {
+                        linkDead = true
+                    }
+                } else if (!connected) {
+                    connected = true
+                    setStatus("bağlı ✓ $target")
+                    trySend(Protocol.soundListReq(session))
+                }
+
+                if (now - lastHb >= 500) {
+                    lastHb = now
+                    trySend(Protocol.heartbeat(session, (now - t0).toInt()))
+                }
+
+                // Soundpad istekleri (Activity'den)
+                val ps = pendingSound
+                if (ps != -2) {
+                    pendingSound = -2
+                    if (ps == -1) trySend(Protocol.soundStop(session))
+                    else if (ps >= 0) trySend(Protocol.soundPlay(session, ps))
+                }
+
+                // Mikrofonu OKUMAYA HER ZAMAN devam et.
+                var got = 0
+                while (got < frame && !stopFlag) {
+                    val r = rec.read(pcm, got, frame - got)
+                    if (r <= 0) break
+                    got += r
+                }
+                if (got < frame) {
+                    SystemClock.sleep(5) // mikrofon geçici veri vermezse sıkı döngüye girme
+                    continue
+                }
+
+                if (muted) pcm.fill(0)
+
+                // Kazanç + yumuşak sınırlayıcı (kübik soft-clip)
+                val g = gainPercent / 100f
+                if (g != 1f && !muted) {
+                    for (i in 0 until frame) {
+                        var s = (pcm[i] * g / 32768f).coerceIn(-1.5f, 1.5f)
+                        s -= s * s * s / 6.75f
+                        pcm[i] = (s * 32767f).toInt().toShort()
+                    }
+                }
+
+                val n = try {
+                    enc.encode(pcm, 0, frame, encBuf, 0, encBuf.size)
+                } catch (_: Exception) {
+                    continue
+                }
+                trySend(Protocol.audio(session, seq, seq * frame, encBuf, n))
+                seq++
+            }
+
+            repeat(3) { trySend(Protocol.bye(session)) }
+            activeLink = null
+            link.close()
+            recvThread.join(500)
         }
 
-        repeat(3) { trySend(Protocol.bye(session)) }
         try {
             rec.stop()
         } catch (_: Exception) {
         }
         try {
             ns?.release()
+        } catch (_: Exception) {
+        }
+        try {
+            aec?.release()
         } catch (_: Exception) {
         }
         rec.release()
@@ -309,13 +441,11 @@ class StreamService : Service() {
     private fun stopWorkers() {
         stopFlag = true
         try {
-            socket?.close()
+            activeLink?.close() // bloklayan recv/send'i kır
         } catch (_: Exception) {
         }
         worker?.join(1500)
-        receiver?.join(500)
         worker = null
-        receiver = null
     }
 
     private fun stopStreaming() {
@@ -327,6 +457,7 @@ class StreamService : Service() {
     private fun shutdown() {
         running = false
         statusText = "durduruldu"
+        soundNames = emptyList()
         try {
             wakeLock?.release()
         } catch (_: Exception) {

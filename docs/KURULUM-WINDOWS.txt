@@ -40,8 +40,25 @@ PC BULUNAMADI diyorsa (sirayla):
   "IPv4 Adresi" satirindaki adresi (192.168.x.x) telefondaki kutuya yaz ->
   Baglan. Uygulama adresi hatirlar, bir daha gerek kalmaz.
 
+YENI OZELLIKLER (v0.3.0):
+- SOUNDPAD: arp-gui.exe'nin yanina "soundpad" adinda klasor acin, icine
+  mp3/ogg/wav/flac atin. Programi acinca dugmeler cikar; ayni dugmeler
+  telefonda da gorunur, telefondan da calinabilir (uzun basma = durdur).
+- YANKI ENGELLEME (deneysel): penceredeki kutuyu isaretleyin — hoparlorden
+  cikan ses telefon mikrofonundan geri geliyorsa bastirir.
+  Kesin cozum yine de kulaklik kullanmaktir.
+- USB (KABLO) MODU: Wi-Fi'siz, en dusuk gecikmeli yol.
+  1. Telefonda "USB hata ayiklama"yi acin (Ayarlar -> Telefon hakkinda ->
+     Yapi numarasina 7 kez dokun -> Gelistirici secenekleri -> USB hata ayiklama)
+  2. Kabloyu takin, telefondaki izin sorusuna evet deyin
+  3. PC'de arp-gui'deki "USB baglantisini kur" dugmesine basin
+     (adb gerekir: https://developer.android.com/tools/releases/platform-tools
+      zip'ini acip adb.exe'yi arp-gui.exe'nin yanina koymak yeterli)
+  4. Telefonda "USB (kablo) modu"nu isaretleyip Baglan'a basin
+
 Ipuclari:
-- Ses dusukse: telefondaki "Mikrofon seviyesi" kaydiricisini yukselt.
+- Ses dusukse: telefondaki "Mikrofon seviyesi" kaydiricisini yukselt
+  (PC penceresinde de ayrica kazanc var).
 - Discord'da ses kesiliyorsa: Ayarlar -> Ses ve Goruntu ->
   "Giris Hassasiyetini Otomatik Belirle" KAPAT, esigi sola cek;
   Gurultu Engelleme'yi (Krisp) kapat.

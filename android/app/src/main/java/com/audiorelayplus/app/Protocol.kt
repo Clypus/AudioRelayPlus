@@ -21,6 +21,10 @@ object Protocol {
     const val T_HEARTBEAT: Byte = 6
     const val T_HEARTBEAT_ACK: Byte = 7
     const val T_BYE: Byte = 8
+    const val T_SOUND_LIST_REQ: Byte = 9
+    const val T_SOUND_LIST: Byte = 10
+    const val T_SOUND_PLAY: Byte = 11
+    const val T_SOUND_STOP: Byte = 12
 
     const val CODEC_PCM16: Byte = 0
     const val CODEC_OPUS: Byte = 1
@@ -54,6 +58,36 @@ object Protocol {
 
     fun bye(session: Int): ByteArray =
         header(T_BYE, 4).putInt(session).array()
+
+    fun soundListReq(session: Int): ByteArray =
+        header(T_SOUND_LIST_REQ, 4).putInt(session).array()
+
+    fun soundPlay(session: Int, id: Int): ByteArray =
+        header(T_SOUND_PLAY, 5).putInt(session).put(id.toByte()).array()
+
+    fun soundStop(session: Int): ByteArray =
+        header(T_SOUND_STOP, 4).putInt(session).array()
+
+    /** USB/TCP çerçevesi: [uzunluk u16 BE][paket]. */
+    fun tcpFrame(pkt: ByteArray): ByteArray =
+        ByteBuffer.allocate(2 + pkt.size).putShort(pkt.size.toShort()).put(pkt).array()
+
+    /** SOUND_LIST gövdesini çözer. */
+    fun parseSoundList(body: ByteBuffer): List<String> {
+        val out = ArrayList<String>()
+        if (body.remaining() < 1) return out
+        val count = body.get().toInt() and 0xff
+        repeat(count) {
+            if (body.remaining() < 2) return out
+            body.get() // id (sıra ile aynı)
+            val len = body.get().toInt() and 0xff
+            if (body.remaining() < len) return out
+            val b = ByteArray(len)
+            body.get(b)
+            out.add(String(b, Charsets.UTF_8))
+        }
+        return out
+    }
 
     /** Başlık geçerliyse tip + gövdeye konumlanmış buffer döner. */
     class Parsed(val type: Byte, val body: ByteBuffer)
