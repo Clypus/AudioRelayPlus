@@ -1,0 +1,15 @@
+# Rust
+/receiver/target/
+
+# Android
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+*.apk
+!*.md
+
+# Editör / işletim sistemi
+.idea/
+*.iml
+.DS_Store

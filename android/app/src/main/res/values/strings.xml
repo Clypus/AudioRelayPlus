@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AudioRelay+</string>
+    <string name="scan">PC\'leri Tara</string>
+    <string name="connect">Bağlan</string>
+    <string name="stop">Durdur</string>
+    <string name="mute">Sustur</string>
+    <string name="unmute">Açık</string>
+    <string name="manual_ip_hint">veya PC IP adresi gir (örn. 192.168.1.23)</string>
+    <string name="status_ready">hazır — PC\'de arp-receiver çalışıyor olmalı</string>
+    <string name="notif_channel">Mikrofon akışı</string>
+    <string name="gain_label">Mikrofon seviyesi: %150</string>
+    <string name="noise_suppress">Gürültü azaltma</string>
+</resources>

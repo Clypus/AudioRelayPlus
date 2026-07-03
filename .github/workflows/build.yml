@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  receiver-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bağımlılıklar (ALSA + cmake + GUI kütüphaneleri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev cmake \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgtk-3-dev
+      - name: Test
+        run: cargo test --manifest-path receiver/Cargo.toml
+      - name: Derle
+        run: cargo build --release --manifest-path receiver/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arp-receiver-linux-x86_64
+          path: |
+            receiver/target/release/arp-gui
+            receiver/target/release/arp-receiver
+            receiver/target/release/arp-tools
+
+  receiver-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --manifest-path receiver/Cargo.toml
+      - name: Derle
+        run: cargo build --release --manifest-path receiver/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arp-receiver-windows-x86_64
+          path: |
+            receiver/target/release/arp-gui.exe
+            receiver/target/release/arp-receiver.exe
+            receiver/target/release/arp-tools.exe
+
+  android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: APK derle
+        run: cd android && ./gradlew assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audiorelayplus-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk

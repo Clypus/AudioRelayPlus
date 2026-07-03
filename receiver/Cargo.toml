@@ -1,0 +1,33 @@
+[package]
+name = "audiorelayplus-receiver"
+version = "0.2.0"
+edition = "2021"
+description = "AudioRelayPlus PC alıcısı: telefon mikrofonunu ağdan alıp ses aygıtına verir"
+
+[lib]
+name = "arp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arp-receiver"
+path = "src/bin/receiver.rs"
+
+[[bin]]
+name = "arp-tools"
+path = "src/bin/tools.rs"
+
+[[bin]]
+name = "arp-gui"
+path = "src/bin/gui.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+eframe = "0.29"
+hound = "3.5"
+opus = "0.3"
+
+[profile.release]
+lto = true
+strip = true
