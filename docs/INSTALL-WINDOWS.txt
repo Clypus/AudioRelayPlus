@@ -1,0 +1,73 @@
+AudioRelayPlus - Windows setup
+==============================
+
+1) Install VB-Cable (free, once): https://vb-audio.com/Cable/
+   Unzip it -> RIGHT-CLICK VBCABLE_Setup_x64.exe -> Run as administrator.
+   Restart the PC if it asks you to.
+
+2) Unzip AudioRelayPlus and double-click arp-gui.exe.
+   - "Windows protected your PC" (blue window): "More info" -> "Run anyway".
+   - If Windows Firewall asks, tick BOTH Private AND Public, then Allow.
+   - "Output device" should say "CABLE Input" (picked automatically when
+     VB-Cable is installed). If not, choose it from the list.
+   - If "Firewall" says there is no rule, click "Allow (admin)" and answer
+     Yes. This fixes the most common problem: the phone not finding the PC.
+   - Optional: tick "Start with Windows (minimized)" so it's always ready.
+
+3) Install the APK on the phone and open the app. If the PC is on the same
+   Wi-Fi it shows up in the list -> tap it. (The first time it asks for the
+   microphone permission and the battery exemption: allow both.)
+   From then on the app connects by itself when you open it.
+
+   Upgrading from v0.3? Uninstall the old app first, once (new signing key).
+
+4) In Discord / your game, pick "CABLE Output" as the microphone. Done!
+
+IF THE PHONE DOESN'T FIND THE PC (in this order):
+- Is arp-gui.exe open, with no red error text in the window?
+- Is the phone on Wi-Fi, on the SAME router as the PC?
+  (mobile data won't work, and neither will a "Guest" network)
+- Did you click "Allow (admin)" next to "Firewall" (step 2)?
+  By hand: Start -> type "cmd" -> right-click -> Run as administrator ->
+  paste this line -> Enter:
+    netsh advfirewall firewall add rule name="AudioRelayPlus" dir=in action=allow protocol=UDP localport=48222
+  Making the network "Private" helps too:
+  Settings -> Network & Internet -> Wi-Fi -> your network ->
+  Network profile type: Private.
+- DIAGNOSIS: when you tap "Scan for PCs" on the phone, the "Events" part of
+  the PC window should show a "discovery request from ..." line.
+  * No line: the packets don't reach the PC -> firewall / same network.
+  * The line shows up but the phone still sees nothing: the router has
+    "AP isolation / client isolation" on -> turn it off in the router.
+- Last resort, connect by hand: while waiting, the PC window shows
+  "manual connect: 192.168.x.x". Type that address into the box in the app
+  -> Connect. The app remembers it.
+
+USB (CABLE) MODE - no Wi-Fi, lowest latency:
+  1. On the phone enable "USB debugging" (Settings -> About phone -> tap
+     "Build number" 7 times -> Developer options -> USB debugging).
+  2. Download Google's platform-tools:
+     https://developer.android.com/tools/releases/platform-tools
+     and unzip it NEXT TO arp-gui.exe (you get a "platform-tools" folder
+     beside it; adb.exe needs the DLLs in that folder, it won't run alone).
+  3. Plug in the cable and accept the prompt on the phone.
+     The PC window says "... ready". In the app, tap the "(USB cable)" entry.
+  "USB cable: automatic" must be ticked in the PC window (it is by default).
+
+SOUNDPAD:
+  Drag mp3/ogg/wav/flac files onto the arp-gui window (or click "Folder" and
+  copy them there). Buttons appear in the window and on the phone; on the
+  phone tap = play, long-press = stop. "hear it myself" also plays them on
+  your speakers.
+
+TIPS:
+- Too quiet: raise "Mic level" in the app (the PC window has a gain slider
+  too). The level bar in the PC window shows what Discord receives.
+- Background noise (fan, keyboard): tick "AI noise suppression" in the PC
+  window.
+- Discord cuts words off: Settings -> Voice & Video -> turn OFF
+  "Automatically determine input sensitivity" and drag the threshold to the
+  left; turn off Discord's own noise suppression (Krisp) and use ours.
+- Your friend's voice echoes back: use headphones (or try the experimental
+  echo cancellation).
+- Xiaomi/Samsung etc.: App settings -> Battery -> "No restrictions".

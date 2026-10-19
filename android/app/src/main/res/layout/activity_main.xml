@@ -21,12 +21,12 @@
         android:text="@string/status_ready"
         android:textSize="15sp" />
 
+    <!-- Text is set in code (it carries the current percentage) -->
     <TextView
         android:id="@+id/gainLabel"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="@string/gain_label" />
+        android:layout_marginTop="12dp" />
 
     <SeekBar
         android:id="@+id/gainBar"
@@ -55,10 +55,10 @@
     </LinearLayout>
 
     <CheckBox
-        android:id="@+id/usbBox"
+        android:id="@+id/autoConnectBox"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/usb_mode" />
+        android:text="@string/auto_connect" />
 
     <Button
         android:id="@+id/scanBtn"
@@ -125,7 +125,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:textOff="@string/unmute"
-            android:textOn="@string/mute" />
+            android:textOff="@string/mic_on"
+            android:textOn="@string/mic_muted" />
     </LinearLayout>
 </LinearLayout>

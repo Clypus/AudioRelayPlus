@@ -7,13 +7,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   receiver-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Bağımlılıklar (ALSA + cmake + GUI kütüphaneleri)
+      - name: Dependencies (ALSA + cmake + GUI libraries)
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev cmake \
@@ -21,7 +24,7 @@ jobs:
             libxkbcommon-dev libwayland-dev libgtk-3-dev
       - name: Test
         run: cargo test --manifest-path receiver/Cargo.toml
-      - name: Derle
+      - name: Build
         run: cargo build --release --manifest-path receiver/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:
@@ -34,15 +37,15 @@ jobs:
   receiver-windows:
     runs-on: windows-latest
     env:
-      # audiopus_sys'in paketlediği libopus eski cmake_minimum_required içeriyor;
-      # CMake 4.x bunu reddediyor. Bu değişken eski sürümle yapılandırmaya izin verir.
+      # The libopus bundled by audiopus_sys has an old cmake_minimum_required
+      # that CMake 4.x rejects; this lets it configure with the old policies.
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
         run: cargo test --manifest-path receiver/Cargo.toml
-      - name: Derle
+      - name: Build
         run: cargo build --release --manifest-path receiver/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:
@@ -61,9 +64,67 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
-      - name: APK derle
-        run: cd android && ./gradlew assembleDebug --no-daemon
+      - name: Debug APK
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          cd android && ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk AudioRelayPlus.apk
+      - name: Signed release APK
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          ARP_KEYSTORE_B64: ${{ secrets.ARP_KEYSTORE_B64 }}
+          ARP_KEYSTORE_PASSWORD: ${{ secrets.ARP_KEYSTORE_PASSWORD }}
+          ARP_KEY_ALIAS: ${{ secrets.ARP_KEY_ALIAS }}
+          ARP_KEY_PASSWORD: ${{ secrets.ARP_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ARP_KEYSTORE_B64" ]; then
+            echo "::error::Signing secrets are missing (ARP_KEYSTORE_B64 etc.)"
+            exit 1
+          fi
+          echo "$ARP_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export ARP_KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          cd android && ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk AudioRelayPlus.apk
+          rm -f "$RUNNER_TEMP/release.jks"
       - uses: actions/upload-artifact@v4
         with:
           name: audiorelayplus-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: android/AudioRelayPlus.apk
+
+  # On a version tag: package everything and publish the GitHub release,
+  # with this version's section of CHANGELOG.md as the notes.
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: [receiver-linux, receiver-windows, android-apk]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Package
+        run: |
+          V="$GITHUB_REF_NAME"
+          mkdir -p pkg/win "pkg/AudioRelayPlus-$V" out
+          # Windows: binaries, the install guides (CRLF for Notepad), license
+          cp dist/arp-receiver-windows-x86_64/*.exe pkg/win/
+          for f in docs/INSTALL-WINDOWS.txt docs/KURULUM-WINDOWS.txt LICENSE; do
+            name=$(basename "$f" .txt).txt
+            sed 's/$/\r/' "$f" > "pkg/win/$name"
+          done
+          (cd pkg/win && zip -9 -r "../../out/AudioRelayPlus-Windows-$V.zip" .)
+          # Linux: binaries, the virtual mic script, docs
+          cp dist/arp-receiver-linux-x86_64/* scripts/linux-virtual-mic.sh README.md LICENSE "pkg/AudioRelayPlus-$V/"
+          chmod +x "pkg/AudioRelayPlus-$V"/arp-* "pkg/AudioRelayPlus-$V/linux-virtual-mic.sh"
+          tar -C pkg -czf "out/AudioRelayPlus-Linux-$V.tar.gz" "AudioRelayPlus-$V"
+          # Android
+          cp dist/audiorelayplus-apk/AudioRelayPlus.apk "out/AudioRelayPlus-Android-$V.apk"
+          awk -v head="## $V" '$0 == head { on = 1; next } /^## / { on = 0 } on' CHANGELOG.md > notes.md
+          test -s notes.md || echo "See CHANGELOG.md." > notes.md
+          ls -la out
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* --title "AudioRelayPlus $GITHUB_REF_NAME" --notes-file notes.md

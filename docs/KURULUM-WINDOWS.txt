@@ -1,65 +1,71 @@
-AudioRelayPlus - Windows Kurulumu
-==================================
+﻿AudioRelayPlus - Windows Kurulumu
+=================================
 
-1) VB-Cable kur (tek seferlik, ucretsiz): https://vb-audio.com/Cable/
-   Zip'i ac -> VBCABLE_Setup_x64.exe'ye SAG TIK -> yonetici olarak calistir.
+1) VB-Cable'ı kur (ücretsiz, bir kere): https://vb-audio.com/Cable/
+   Zip'i aç -> VBCABLE_Setup_x64.exe'ye SAĞ TIK -> Yönetici olarak çalıştır.
+   Yeniden başlatma isterse bilgisayarı yeniden başlat.
 
-2) arp-gui.exe'yi cift tikla ac.
-   - "Windows PC'nizi korudu" (mavi pencere) cikarsa: "Ek bilgi" -> "Yine de calistir".
-   - Guvenlik duvari sorarsa HEM OZEL HEM GENEL kutularini isaretleyip izin ver.
-   - "Cikis aygiti" listesinden "CABLE Input" sec.
+2) AudioRelayPlus zip'ini aç, arp-gui.exe'ye çift tıkla.
+   - "Windows PC'nizi korudu" (mavi pencere) çıkarsa: "Ek bilgi" -> "Yine de çalıştır".
+   - Güvenlik duvarı sorarsa HEM ÖZEL HEM GENEL kutularını işaretleyip izin ver.
+   - "Çıkış aygıtı" "CABLE Input" olmalı (VB-Cable kuruluysa kendisi seçer).
+     Değilse listeden seç.
+   - "Güvenlik duvarı" yanında "kural yok" yazıyorsa "İzin ver (yönetici)"ye
+     bas ve Evet de. Telefonun PC'yi bulamaması (en sık sorun) böyle çözülür.
+   - İsteğe bağlı: "Windows açılınca başlat" kutusunu işaretle, hep hazır olsun.
 
-3) ONEMLI - Telefon PC'yi bulamiyorsa bu adimi yap (en sik sorun):
-   Windows cogu Wi-Fi agini "Genel" sayar ve gelen baglantilari keser.
+3) Telefona APK'yı kur, uygulamayı aç. PC aynı Wi-Fi'daysa listede görünür ->
+   dokun. (İlk seferde mikrofon izni ve pil muafiyeti sorulur, ikisine de
+   izin ver.) Sonraki açılışlarda uygulama kendiliğinden bağlanır.
 
-   KESIN COZUM - Baslat'a "cmd" yaz -> sag tik -> Yonetici olarak calistir ->
-   su satiri yapistir -> Enter:
+   v0.3'ten mi güncelliyorsun? Önce eski uygulamayı bir kere kaldır (imza değişti).
 
-   netsh advfirewall firewall add rule name="AudioRelayPlus" dir=in action=allow protocol=UDP localport=48222
+4) Discord/oyunda mikrofon olarak "CABLE Output" seç. Bitti!
 
-   Ek olarak agi "Ozel" yapmak da iyi olur:
-   Ayarlar -> Ag ve Internet -> Wi-Fi -> bagli agin adina tikla ->
-   Ag profili turu: OZEL.
+PC BULUNAMADI DİYORSA (sırayla):
+- arp-gui.exe açık mı, pencerede kırmızı hata yazısı yok mu?
+- Telefon Wi-Fi'da mı, PC ile AYNI modeme mi bağlı?
+  (mobil veri olmaz, "Misafir/Guest" ağı olmaz)
+- "Güvenlik duvarı" yanındaki "İzin ver (yönetici)"ye bastın mı (2. adım)?
+  Elle yapmak istersen: Başlat'a "cmd" yaz -> sağ tık -> Yönetici olarak
+  çalıştır -> şu satırı yapıştır -> Enter:
+    netsh advfirewall firewall add rule name="AudioRelayPlus" dir=in action=allow protocol=UDP localport=48222
+  Ağı "Özel" yapmak da iyi olur:
+  Ayarlar -> Ağ ve İnternet -> Wi-Fi -> bağlı ağın adına tıkla ->
+  Ağ profili türü: ÖZEL.
+- TEŞHİS: Telefonda "PC'leri Tara"ya basınca PC penceresinin "Olaylar"
+  kısmında "keşif isteği geldi" satırı çıkmalı.
+  * Çıkmıyorsa: paketler PC'ye ulaşmıyor -> güvenlik duvarı / aynı ağ kontrolü.
+  * Çıkıyor ama telefon görmüyorsa: modemde "AP isolation / istemci
+    yalıtımı" açık olabilir -> modem ayarından kapat.
+- Son çare elle bağlantı: PC penceresi beklerken "elle bağlanmak için:
+  192.168.x.x" gösterir. O adresi telefondaki kutuya yaz -> Bağlan.
+  Uygulama adresi hatırlar.
 
-4) Telefona APK'yi kur, uygulamayi ac. PC ayni Wi-Fi'daysa listede gorunur -> dokun.
-   (Ilk seferde mikrofon izni ve pil muafiyeti sorulur, onayla.)
+USB (KABLO) MODU - Wi-Fi'sız, en düşük gecikme:
+  1. Telefonda "USB hata ayıklama"yı aç (Ayarlar -> Telefon hakkında ->
+     "Yapı numarası"na 7 kez dokun -> Geliştirici seçenekleri -> USB hata ayıklama).
+  2. Google'ın platform-tools paketini indir:
+     https://developer.android.com/tools/releases/platform-tools
+     ve arp-gui.exe'nin YANINA aç (yanında "platform-tools" klasörü oluşur;
+     adb.exe o klasördeki DLL'ler olmadan çalışmaz).
+  3. Kabloyu tak, telefondaki izin sorusuna evet de.
+     PC penceresinde "... hazır" yazar. Uygulamada "(USB kablo)" satırına dokun.
+  PC penceresinde "USB kablo: otomatik" işaretli olmalı (varsayılan öyle).
 
-5) Discord/oyunda mikrofon olarak "CABLE Output" sec. Bitti!
+SOUNDPAD:
+  mp3/ogg/wav/flac dosyalarını arp-gui penceresine sürükle (ya da "Klasör"e
+  basıp oraya kopyala). Düğmeler hem pencerede hem telefonda çıkar; telefonda
+  dokun = çal, uzun bas = durdur. "ben de duyayım" sesleri hoparlörden de çalar.
 
-PC BULUNAMADI diyorsa (sirayla):
-- arp-gui.exe acik mi, pencerede kirmizi hata yazisi yok mu?
-- Telefon Wi-Fi'da mi, PC ile AYNI modeme mi bagli?
-  (mobil veri olmaz, "Misafir/Guest" agi olmaz)
-- Yukaridaki 3. adimi yaptin mi?
-- TESHIS: Telefonda "PC'leri Tara"ya basinca PC'deki pencerenin "Olaylar"
-  kisminda "kesif istegi geldi" satiri cikmali.
-  * Cikmiyorsa: paketler PC'ye ulasmiyor -> 3. adim + ayni ag kontrolu.
-  * Cikiyor ama telefon gormuyorsa: modemde "AP isolation / istemci
-    yalitimi" acik olabilir -> modem ayarindan kapat.
-- Son care manuel baglanti: PC'de Baslat -> cmd -> "ipconfig" yaz ->
-  "IPv4 Adresi" satirindaki adresi (192.168.x.x) telefondaki kutuya yaz ->
-  Baglan. Uygulama adresi hatirlar, bir daha gerek kalmaz.
-
-YENI OZELLIKLER (v0.3.0):
-- SOUNDPAD: arp-gui.exe'nin yanina "soundpad" adinda klasor acin, icine
-  mp3/ogg/wav/flac atin. Programi acinca dugmeler cikar; ayni dugmeler
-  telefonda da gorunur, telefondan da calinabilir (uzun basma = durdur).
-- YANKI ENGELLEME (deneysel): penceredeki kutuyu isaretleyin — hoparlorden
-  cikan ses telefon mikrofonundan geri geliyorsa bastirir.
-  Kesin cozum yine de kulaklik kullanmaktir.
-- USB (KABLO) MODU: Wi-Fi'siz, en dusuk gecikmeli yol.
-  1. Telefonda "USB hata ayiklama"yi acin (Ayarlar -> Telefon hakkinda ->
-     Yapi numarasina 7 kez dokun -> Gelistirici secenekleri -> USB hata ayiklama)
-  2. Kabloyu takin, telefondaki izin sorusuna evet deyin
-  3. PC'de arp-gui'deki "USB baglantisini kur" dugmesine basin
-     (adb gerekir: https://developer.android.com/tools/releases/platform-tools
-      zip'ini acip adb.exe'yi arp-gui.exe'nin yanina koymak yeterli)
-  4. Telefonda "USB (kablo) modu"nu isaretleyip Baglan'a basin
-
-Ipuclari:
-- Ses dusukse: telefondaki "Mikrofon seviyesi" kaydiricisini yukselt
-  (PC penceresinde de ayrica kazanc var).
-- Discord'da ses kesiliyorsa: Ayarlar -> Ses ve Goruntu ->
-  "Giris Hassasiyetini Otomatik Belirle" KAPAT, esigi sola cek;
-  Gurultu Engelleme'yi (Krisp) kapat.
-- Telefonda Xiaomi/Samsung vb.: Uygulama ayarlari -> Pil -> "Kisitlama yok".
+İPUÇLARI:
+- Ses düşükse: uygulamadaki "Mikrofon seviyesi"ni artır (PC penceresinde de
+  kazanç var). PC penceresindeki seviye çubuğu Discord'a giden sesi gösterir.
+- Arka plan gürültüsü (fan, klavye): PC penceresinde "Yapay zekâ gürültü
+  engelleme"yi aç.
+- Discord'da ses kesiliyorsa: Ayarlar -> Ses ve Görüntü ->
+  "Giriş Hassasiyetini Otomatik Belirle"yi KAPAT, eşiği sola çek;
+  Discord'un kendi gürültü engellemesini (Krisp) kapat, bizimkini kullan.
+- Arkadaşının sesi yankı yapıyorsa: kulaklık kullan (ya da deneysel yankı
+  engellemeyi dene).
+- Xiaomi/Samsung vb.: Uygulama ayarları -> Pil -> "Kısıtlama yok".

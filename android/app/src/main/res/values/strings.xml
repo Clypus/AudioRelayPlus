@@ -1,17 +1,51 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">AudioRelay+</string>
-    <string name="scan">PC\'leri Tara</string>
-    <string name="connect">Bağlan</string>
-    <string name="stop">Durdur</string>
-    <string name="mute">Sustur</string>
-    <string name="unmute">Açık</string>
-    <string name="manual_ip_hint">veya PC IP adresi gir (örn. 192.168.1.23)</string>
-    <string name="status_ready">hazır — PC\'de arp-receiver çalışıyor olmalı</string>
-    <string name="notif_channel">Mikrofon akışı</string>
-    <string name="gain_label">Mikrofon seviyesi: %150</string>
-    <string name="noise_suppress">Gürültü azaltma</string>
-    <string name="phone_aec">Yankı eng. (telefon)</string>
-    <string name="usb_mode">USB (kablo) modu — önce PC\'de "USB bağlantısını kur"</string>
-    <string name="soundpad">Soundpad (uzun bas: durdur)</string>
+    <string name="app_name" translatable="false">AudioRelay+</string>
+
+    <!-- Main screen -->
+    <string name="scan">Scan for PCs</string>
+    <string name="connect">Connect</string>
+    <string name="stop">Stop</string>
+    <string name="mic_on">Mic on</string>
+    <string name="mic_muted">Muted</string>
+    <string name="manual_ip_hint">or enter the PC\'s IP address (e.g. 192.168.1.23)</string>
+    <string name="gain_label">Mic level: %1$d%%</string>
+    <string name="noise_suppress">Noise suppression</string>
+    <string name="phone_aec">Echo cancel (phone)</string>
+    <string name="auto_connect">Auto-connect to the last PC</string>
+    <string name="soundpad">Soundpad (long-press: stop)</string>
+    <string name="usb_label">USB cable</string>
+
+    <!-- Status line -->
+    <string name="status_ready">ready — the AudioRelayPlus receiver must be running on the PC</string>
+    <string name="status_scanning">Scanning for PCs…</string>
+    <string name="status_none_found">No PC found — is the receiver open on the PC, and is UDP 48222 allowed through its firewall? You can also connect by IP.</string>
+    <plurals name="status_found">
+        <item quantity="one">%d PC found — tap to connect</item>
+        <item quantity="other">%d PCs found — tap to connect</item>
+    </plurals>
+    <string name="status_connecting">connecting: %1$s…</string>
+    <string name="status_auto_connecting">auto-connecting: %1$s…</string>
+    <string name="status_connected">connected ✓ %1$s</string>
+    <string name="status_link_lost">connection lost — retrying…</string>
+    <string name="status_pc_moved">PC moved to %1$s — reconnecting…</string>
+    <string name="status_usb_unavailable">No USB link — is the receiver open on the PC and USB debugging enabled on the phone?</string>
+    <string name="status_net_error">network error: %1$s</string>
+    <string name="status_mic_failed">couldn\'t open the microphone ❌</string>
+    <string name="status_mic_failed_reason">couldn\'t open the microphone: %1$s ❌</string>
+    <string name="status_opus_error">Opus encoder error: %1$s ❌</string>
+    <string name="status_stopped">stopped</string>
+    <string name="status_rtt">%1$s  (latency ~%2$d ms)</string>
+
+    <!-- Notification -->
+    <string name="notif_channel">Microphone stream</string>
+    <string name="notif_muted">🔇 muted · %1$s</string>
+    <string name="action_mute">Mute</string>
+    <string name="action_unmute">Unmute</string>
+
+    <!-- Toasts -->
+    <string name="toast_need_ip">Enter an IP address or pick a PC from the list</string>
+    <string name="toast_sounds_stopped">Sounds stopped</string>
+    <string name="toast_mic_permission">The app can\'t work without the microphone permission 🙂</string>
+    <string name="toast_battery">Remove the battery restriction for uninterrupted audio 👍</string>
 </resources>

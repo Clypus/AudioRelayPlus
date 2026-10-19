@@ -1,18 +1,24 @@
-//! Adaptif jitter tamponu — "kesik kesik ses" sorununun çözüldüğü yer.
+//! Adaptive jitter buffer — where "choppy audio" gets fixed.
 //!
-//! Zaman tabanı deterministiktir: her şey "çekilen örnek sayısı" üzerinden
-//! yürür, duvar saati kullanılmaz. Böylece birim testlerde ağ koşulları
-//! birebir simüle edilebilir.
+//! The time base is deterministic: everything runs on "samples pulled", never
+//! on the wall clock, so unit tests can replay network conditions exactly.
+//!
+//! Adaptation in one paragraph: the buffer aims for `target_ms` of audio.
+//! When it runs dry it conceals (PLC) but keeps waiting for the missing packet
+//! instead of skipping it ("elastic"): a merely late packet is still played and
+//! the buffer has grown by the concealed time, which then becomes the new
+//! target. Packets that arrive after their slot was already concealed also
+//! raise the target. A long clean run lowers it again (AIMD).
 
 use std::collections::{BTreeMap, VecDeque};
 
-/// Bir çerçeveyi PCM'e çözen soyutlama (Opus veya düz PCM16).
+/// Turns a frame into PCM (Opus or raw PCM16).
 pub trait FrameDecoder {
-    /// Normal çözüm. `out` tam bir çerçeve uzunluğundadır.
+    /// Normal decode. `out` is exactly one frame long.
     fn decode(&mut self, payload: &[u8], out: &mut [f32]);
-    /// Kayıp çerçeveyi, onu TAKİP EDEN paketin in-band FEC verisinden kurtar.
+    /// Rebuild a lost frame from the in-band FEC data of the packet that FOLLOWS it.
     fn decode_fec(&mut self, next_payload: &[u8], out: &mut [f32]);
-    /// Paket kaybı gizleme (PLC): elde hiçbir veri yokken çerçeve sentezle.
+    /// Packet loss concealment (PLC): synthesize a frame when there is no data at all.
     fn conceal(&mut self, out: &mut [f32]);
 }
 
@@ -23,16 +29,20 @@ pub struct JitterConfig {
     pub start_target_ms: u32,
     pub min_target_ms: u32,
     pub max_target_ms: u32,
-    /// Üst üste en fazla bu kadar çerçeve PLC ile doldurulur, sonra yeniden tamponlanır.
+    /// At most this many consecutive frames are concealed, then we rebuffer.
     pub plc_limit_frames: u32,
-    /// Bu boyuta kadar boşluklar PLC ile geçilir; daha büyükse ileri sarılır.
+    /// Gaps up to this size are concealed; bigger ones are skipped over.
     pub small_gap_frames: u64,
-    /// Bu kadar saniye sorunsuz oynatmadan sonra hedef gecikme azaltılır.
+    /// After this many seconds of clean playback the target is lowered.
     pub decrease_after_s: u32,
-    /// Tampon bu sınırı aşarsa en eski veri atlanır (taşma koruması).
+    /// If the buffer grows past this, the oldest audio is dropped (overflow guard).
     pub hard_cap_ms: u32,
-    /// Playing durumundayken bundan büyük seq sıçraması oturum resetine yorulur.
+    /// While playing, a seq jump bigger than this is treated as a sender reset.
     pub resync_jump_frames: u64,
+    /// Target increase when a packet arrives after its slot was concealed.
+    pub late_bump_ms: u32,
+    /// Upper bound for the target increase after a single stall.
+    pub max_stall_bump_ms: u32,
 }
 
 impl Default for JitterConfig {
@@ -40,8 +50,8 @@ impl Default for JitterConfig {
         JitterConfig {
             sample_rate: 48000,
             frame_samples: 960,
-            // "Ani gelsin": USB/temiz ağda tampon 30 ms'e kadar iner;
-            // dalgalı Wi-Fi'da AIMD yine yukarı taşır.
+            // Low latency first: on USB / a clean network the buffer settles at
+            // 30 ms; on a choppy Wi-Fi the adaptation raises it as needed.
             start_target_ms: 60,
             min_target_ms: 30,
             max_target_ms: 300,
@@ -50,6 +60,8 @@ impl Default for JitterConfig {
             decrease_after_s: 10,
             hard_cap_ms: 400,
             resync_jump_frames: 500,
+            late_bump_ms: 10,
+            max_stall_bump_ms: 40,
         }
     }
 }
@@ -57,14 +69,30 @@ impl Default for JitterConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JitterStats {
     pub pushed: u64,
+    /// Frames decoded from their own packet (the normal path).
+    pub decoded: u64,
     pub late: u64,
     pub fec_recovered: u64,
     pub plc_frames: u64,
+    /// Times the buffer ran dry and then continued with the waited-for audio.
+    pub stalls: u64,
     pub lost_skipped: u64,
     pub underruns: u64,
     pub resyncs: u64,
     pub pulled_samples: u64,
     pub silence_samples: u64,
+}
+
+impl JitterStats {
+    /// Share of played frames that were not decoded from their own packet.
+    pub fn concealed_ratio(&self) -> f64 {
+        let total = self.decoded + self.fec_recovered + self.plc_frames;
+        if total == 0 {
+            0.0
+        } else {
+            (self.fec_recovered + self.plc_frames) as f64 / total as f64
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,23 +102,31 @@ pub enum State {
 }
 
 pub struct PullInfo {
-    /// Bu çekimde üretilen "gerçek olmayan" (tamponlama sessizliği) örnek sayısı.
+    /// Samples of this pull that are "not real" (buffering silence).
     pub silence_samples: usize,
 }
 
 pub struct JitterBuffer {
     cfg: JitterConfig,
     packets: BTreeMap<u64, Vec<u8>>,
-    /// Sarma dayanıklılığı için u32 seq'ler u64'e genişletilir.
+    /// u32 seqs are extended to u64 so wraparound is harmless.
     last_ext: Option<u64>,
-    /// Çalınacak sıradaki çerçevenin genişletilmiş seq'i.
+    /// Extended seq of the next frame to play.
     next_seq: Option<u64>,
     fifo: VecDeque<f32>,
     scratch: Vec<f32>,
     state: State,
     plc_run: u32,
+    /// Frames concealed while waiting for a late `next_seq` (elastic stall).
+    stall_frames: u32,
     target_ms: u32,
     clean_samples: u64,
+    /// Pulled samples left before a late arrival may raise the target again.
+    late_cooldown: u64,
+    /// Fill smoothed over ~0.5 s of pulls. The instantaneous fill jumps by a
+    /// whole frame whenever a packet lands, so the drift servo and the target
+    /// decrease look at this instead.
+    fill_avg: f64,
     pub stats: JitterStats,
 }
 
@@ -106,8 +142,11 @@ impl JitterBuffer {
             scratch: Vec::new(),
             state: State::Buffering,
             plc_run: 0,
+            stall_frames: 0,
             target_ms,
             clean_samples: 0,
+            late_cooldown: 0,
+            fill_avg: 0.0,
             stats: JitterStats::default(),
         }
     }
@@ -122,6 +161,15 @@ impl JitterBuffer {
 
     pub fn fill_ms(&self) -> u32 {
         (self.fill_samples() as u64 * 1000 / self.cfg.sample_rate as u64) as u32
+    }
+
+    /// Smoothed fill (see `fill_avg`) — what the drift servo should steer by.
+    pub fn avg_fill_ms(&self) -> u32 {
+        (self.fill_avg * 1000.0 / self.cfg.sample_rate as f64) as u32
+    }
+
+    fn frame_ms(&self) -> u32 {
+        (self.cfg.frame_samples as u64 * 1000 / self.cfg.sample_rate as u64) as u32
     }
 
     fn extend_seq(&mut self, seq: u32) -> u64 {
@@ -166,18 +214,24 @@ impl JitterBuffer {
             Some(ns) => ns,
         };
         if ext < ns {
+            // Its slot was already concealed (FEC/PLC): the cushion is too thin
+            // for this network. Ask for more headroom, at most once a second.
             self.stats.late += 1;
+            if self.late_cooldown == 0 {
+                self.bump_target(self.cfg.late_bump_ms);
+                self.late_cooldown = self.cfg.sample_rate as u64;
+            }
             return;
         }
-        // Kuruyup tamponlamaya döndüysek eski çerçeveleri beklemek anlamsız:
-        // akış nereden devam ediyorsa oraya atla.
+        // We ran dry and went back to buffering: waiting for old frames makes
+        // no sense, continue from wherever the stream is now.
         if self.state == State::Buffering && self.packets.is_empty() && self.fifo.is_empty() && ext > ns {
             self.stats.lost_skipped += ext - ns;
             self.next_seq = Some(ext);
             self.packets.insert(ext, payload);
             return;
         }
-        // Devasa sıçrama: istemci resetlendi ya da çok uzun kopukluk.
+        // Huge jump: the client restarted or was gone for a long time.
         if ext - ns > self.cfg.resync_jump_frames {
             self.fast_forward(ext);
         }
@@ -196,6 +250,7 @@ impl JitterBuffer {
         self.next_seq = Some(to);
         self.fifo.clear();
         self.plc_run = 0;
+        self.stall_frames = 0;
         self.stats.resyncs += 1;
     }
 
@@ -218,7 +273,18 @@ impl JitterBuffer {
         self.clean_samples = 0;
     }
 
-    /// Bir çerçeve üretip fifo'ya ekler. Üretemezse (kuru) false döner.
+    /// A stall just ended with real audio: the buffer grew by the concealed
+    /// time. Keep (most of) that headroom so the same spike won't starve us again.
+    fn end_stall(&mut self) {
+        if self.stall_frames > 0 {
+            let grown = self.stall_frames * self.frame_ms();
+            self.stats.stalls += 1;
+            self.bump_target(grown.min(self.cfg.max_stall_bump_ms));
+            self.stall_frames = 0;
+        }
+    }
+
+    /// Produces one frame into the fifo. Returns false if it can't (dry).
     fn produce_frame(&mut self, dec: &mut dyn FrameDecoder) -> bool {
         let ns = match self.next_seq {
             Some(n) => n,
@@ -228,29 +294,33 @@ impl JitterBuffer {
         self.scratch.resize(f, 0.0);
         if let Some(p) = self.packets.remove(&ns) {
             dec.decode(&p, &mut self.scratch);
+            self.stats.decoded += 1;
+            self.end_stall();
             self.plc_run = 0;
             self.next_seq = Some(ns + 1);
         } else if let Some(p) = self.packets.get(&(ns + 1)) {
-            // Tek paketlik kayıp: sonraki paketin FEC verisinden kurtar.
+            // Single missing packet: rebuild it from the next packet's FEC data.
             let p = p.clone();
             dec.decode_fec(&p, &mut self.scratch);
             self.stats.fec_recovered += 1;
+            self.end_stall();
             self.plc_run = 0;
             self.next_seq = Some(ns + 1);
         } else if self.packets.is_empty() {
-            // Tampon tamamen kuru: sınırlı PLC, sonra yeniden tamponla.
+            // Dry buffer: the packet is late (jitter) or lost. Conceal, but keep
+            // waiting for the same seq — if it shows up it is still played and
+            // the buffer simply grew by the concealed time, no real audio lost.
             if self.plc_run < self.cfg.plc_limit_frames {
                 dec.conceal(&mut self.scratch);
                 self.plc_run += 1;
+                self.stall_frames += 1;
                 self.stats.plc_frames += 1;
-                self.next_seq = Some(ns + 1);
-                if self.plc_run == 3 {
-                    self.bump_target(10);
-                }
             } else {
+                // Still nothing: rebuffer (silence) and ask for more headroom.
                 self.state = State::Buffering;
                 self.stats.underruns += 1;
                 self.plc_run = 0;
+                self.stall_frames = 0;
                 self.bump_target(20);
                 return false;
             }
@@ -258,7 +328,7 @@ impl JitterBuffer {
             let low = *self.packets.keys().next().unwrap();
             let gap = low - ns;
             if gap <= self.cfg.small_gap_frames {
-                // Küçük boşluk: PLC ile geç (arkası zaten elimizde).
+                // Small gap: conceal it (what follows is already here).
                 dec.conceal(&mut self.scratch);
                 self.plc_run += 1;
                 self.stats.plc_frames += 1;
@@ -267,12 +337,14 @@ impl JitterBuffer {
                     self.bump_target(10);
                 }
             } else {
-                // Büyük boşluk: robot sesiyle oyalanma, ileri sar.
+                // Big gap: don't drag on with robot voice, skip ahead.
                 self.stats.lost_skipped += gap;
                 self.stats.resyncs += 1;
                 let p = self.packets.remove(&low).unwrap();
                 dec.decode(&p, &mut self.scratch);
+                self.stats.decoded += 1;
                 self.plc_run = 0;
+                self.stall_frames = 0;
                 self.next_seq = Some(low + 1);
             }
         }
@@ -282,9 +354,11 @@ impl JitterBuffer {
 
     pub fn pull(&mut self, out: &mut [f32], dec: &mut dyn FrameDecoder) -> PullInfo {
         self.stats.pulled_samples += out.len() as u64;
+        self.late_cooldown = self.late_cooldown.saturating_sub(out.len() as u64);
         if self.state == State::Buffering {
             if self.next_seq.is_some() && self.fill_samples() >= self.target_samples() {
                 self.state = State::Playing;
+                self.fill_avg = self.fill_samples() as f64;
             } else {
                 out.fill(0.0);
                 self.stats.silence_samples += out.len() as u64;
@@ -303,18 +377,22 @@ impl JitterBuffer {
                 break;
             }
             let n = self.fifo.len().min(out.len() - idx);
-            for i in 0..n {
-                out[idx + i] = self.fifo.pop_front().unwrap();
+            for (o, s) in out[idx..idx + n].iter_mut().zip(self.fifo.drain(..n)) {
+                *o = s;
             }
             idx += n;
         }
-        // Uzun süre sorunsuzsa hedef gecikmeyi yavaşça düşür (AIMD'nin "AI"si ters yönde).
+        let alpha = (out.len() as f64 / (0.5 * self.cfg.sample_rate as f64)).min(1.0);
+        self.fill_avg += (self.fill_samples() as f64 - self.fill_avg) * alpha;
+        // After a long clean run, slowly lower the target delay (the
+        // "decrease" half of AIMD) — but only once the fill has caught up.
         if silence == 0 {
             self.clean_samples += out.len() as u64;
             let need = self.cfg.decrease_after_s as u64 * self.cfg.sample_rate as u64;
+            let half_frame = self.cfg.frame_samples as f64 / 2.0;
             if self.clean_samples >= need
                 && self.target_ms > self.cfg.min_target_ms
-                && self.fill_samples() >= self.target_samples()
+                && self.fill_avg + half_frame >= self.target_samples() as f64
             {
                 self.target_ms = (self.target_ms - 10).max(self.cfg.min_target_ms);
                 self.clean_samples = 0;
@@ -330,9 +408,8 @@ impl JitterBuffer {
 mod tests {
     use super::*;
 
-    /// Test çözücüsü: decode → payload[0], FEC → next_payload[0] - 1 + 0.25,
-    /// PLC → -1.0 değeriyle doldurur. Böylece çıktıdan hangi yolun
-    /// kullanıldığı okunabilir.
+    /// Test decoder: decode → payload[0], FEC → next_payload[0] - 1 + 0.25,
+    /// PLC → -1.0. The output tells which path produced each frame.
     struct Mock;
 
     impl FrameDecoder for Mock {
@@ -350,14 +427,14 @@ mod tests {
     const F: usize = 960;
 
     fn cfg() -> JitterConfig {
-        JitterConfig { start_target_ms: 80, ..Default::default() } // 80 ms = 4 çerçeve
+        JitterConfig { start_target_ms: 80, ..Default::default() } // 80 ms = 4 frames
     }
 
     fn pkt(k: u32) -> Vec<u8> {
         vec![k as u8; 4]
     }
 
-    /// Bir çerçevelik çıktı çekip ilk örneğini döndürür.
+    /// Pulls one frame and returns its first sample.
     fn pull_frame(jb: &mut JitterBuffer, dec: &mut Mock) -> f32 {
         let mut buf = vec![9.9f32; F];
         jb.pull(&mut buf, dec);
@@ -372,24 +449,25 @@ mod tests {
             jb.push(k, pkt(k));
         }
         for k in 0..8u32 {
-            assert_eq!(pull_frame(&mut jb, &mut dec), k as f32, "çerçeve {k}");
+            assert_eq!(pull_frame(&mut jb, &mut dec), k as f32, "frame {k}");
         }
         assert_eq!(jb.stats.plc_frames, 0);
         assert_eq!(jb.stats.fec_recovered, 0);
         assert_eq!(jb.stats.underruns, 0);
+        assert_eq!(jb.stats.decoded, 8);
     }
 
     #[test]
     fn buffering_until_target() {
         let mut jb = JitterBuffer::new(cfg());
         let mut dec = Mock;
-        jb.push(0, pkt(10)); // 1 çerçeve < 4 çerçevelik hedef
-        assert_eq!(pull_frame(&mut jb, &mut dec), 0.0); // sessizlik
+        jb.push(0, pkt(10)); // 1 frame < 4-frame target
+        assert_eq!(pull_frame(&mut jb, &mut dec), 0.0); // silence
         assert_eq!(jb.state(), State::Buffering);
         for k in 1..4u32 {
             jb.push(k, pkt(k + 10));
         }
-        assert_eq!(pull_frame(&mut jb, &mut dec), 10.0); // artık çalıyor: çerçeve 0
+        assert_eq!(pull_frame(&mut jb, &mut dec), 10.0); // playing now: frame 0
         assert_eq!(jb.state(), State::Playing);
         assert_eq!(pull_frame(&mut jb, &mut dec), 11.0);
     }
@@ -407,14 +485,14 @@ mod tests {
         for _ in 0..9 {
             got.push(pull_frame(&mut jb, &mut dec));
         }
-        // 5 numaralı çerçeve FEC ile kurtarılmış olmalı: 6 - 1 + 0.25 = 5.25
+        // Frame 5 must come from FEC: 6 - 1 + 0.25 = 5.25
         assert_eq!(got[5], 5.25);
         assert_eq!(jb.stats.fec_recovered, 1);
         assert_eq!(jb.stats.plc_frames, 0);
     }
 
     #[test]
-    fn dry_buffer_plc_then_late_drop() {
+    fn late_packet_after_dry_plc_is_still_played() {
         let mut jb = JitterBuffer::new(cfg());
         let mut dec = Mock;
         for k in 0..5u32 {
@@ -423,17 +501,42 @@ mod tests {
         for k in 0..5 {
             assert_eq!(pull_frame(&mut jb, &mut dec), k as f32);
         }
-        // Tampon kuru: PLC devrede
+        // Dry: PLC fills in, but frame 5 is still awaited (elastic stall)
         assert_eq!(pull_frame(&mut jb, &mut dec), -1.0);
-        assert!(jb.stats.plc_frames >= 1);
-        // 5. çerçeve PLC ile dolduruldu; şimdi geç gelirse atılmalı
-        jb.push(5, pkt(5));
-        assert_eq!(jb.stats.late, 1);
-        // 6'dan itibaren normal devam
-        for k in 6..10u32 {
+        assert_eq!(jb.stats.plc_frames, 1);
+        let t0 = jb.target_ms();
+        // Frame 5 shows up late: it is played, not thrown away
+        for k in 5..10u32 {
             jb.push(k, pkt(k));
         }
+        assert_eq!(pull_frame(&mut jb, &mut dec), 5.0);
         assert_eq!(pull_frame(&mut jb, &mut dec), 6.0);
+        assert_eq!(jb.stats.late, 0);
+        assert_eq!(jb.stats.stalls, 1);
+        // ...and the 20 ms it grew by is kept as extra headroom
+        assert_eq!(jb.target_ms(), t0 + 20);
+    }
+
+    #[test]
+    fn reordered_packet_raises_target() {
+        let mut jb = JitterBuffer::new(cfg());
+        let mut dec = Mock;
+        for k in 0..10u32 {
+            if k != 4 {
+                jb.push(k, pkt(k));
+            }
+        }
+        for _ in 0..5 {
+            pull_frame(&mut jb, &mut dec); // frame 4 comes from FEC
+        }
+        assert_eq!(jb.stats.fec_recovered, 1);
+        let t0 = jb.target_ms();
+        jb.push(4, pkt(4)); // arrives after its slot: too late
+        assert_eq!(jb.stats.late, 1);
+        assert_eq!(jb.target_ms(), t0 + 10);
+        // A second late packet within the cooldown doesn't stack up
+        jb.push(3, pkt(3));
+        assert_eq!(jb.target_ms(), t0 + 10);
     }
 
     #[test]
@@ -449,7 +552,7 @@ mod tests {
         for _ in 0..10 {
             got.push(pull_frame(&mut jb, &mut dec));
         }
-        // 4 → PLC (-1.0); 5 → ardılı elimizde olduğundan FEC ile kurtarılır (5.25); 6 normal
+        // 4 → PLC (-1.0); 5 → its successor is here, so FEC (5.25); 6 normal
         assert_eq!(got[4], -1.0);
         assert_eq!(got[5], 5.25);
         assert_eq!(got[6], 6.0);
@@ -462,7 +565,7 @@ mod tests {
     fn big_gap_fast_forwards() {
         let mut jb = JitterBuffer::new(cfg());
         let mut dec = Mock;
-        // 4-7 kayıp: small_gap_frames(3)'ten büyük boşluk → PLC yerine ileri sarma
+        // 4-7 lost: bigger than small_gap_frames (3) → skip ahead instead of PLC
         for k in 0..4u32 {
             jb.push(k, pkt(k));
         }
@@ -474,15 +577,15 @@ mod tests {
             got.push(pull_frame(&mut jb, &mut dec));
         }
         assert_eq!(&got[0..4], &[0.0, 1.0, 2.0, 3.0]);
-        assert_eq!(got[4], 8.0, "ileri sarmalıydı");
+        assert_eq!(got[4], 8.0, "should have skipped ahead");
         assert_eq!(jb.stats.resyncs, 1);
         assert_eq!(jb.stats.lost_skipped, 4);
     }
 
     #[test]
     fn huge_span_jumps_to_live_edge() {
-        // Uzun kopukluk sonrası paket patlaması: span hard_cap'i aşar →
-        // canlı uca atlanır (eski ses çalınmaz, gecikme birikmez).
+        // Packet burst after a long outage: the span exceeds hard_cap →
+        // jump to the live edge (no stale audio, no latency build-up).
         let mut jb = JitterBuffer::new(cfg());
         let mut dec = Mock;
         for k in 0..4u32 {
@@ -491,11 +594,11 @@ mod tests {
         for k in 30..40u32 {
             jb.push(k, pkt(k));
         }
-        // hard cap devrede: doluluk 400 ms'i aşmamalı
+        // hard cap in effect: fill must not exceed 400 ms
         assert!(jb.fill_ms() <= 400);
-        // İlk çekilen sesler artık canlı uca yakın olmalı (0..4 çalınmaz)
+        // The first audio pulled must be near the live edge (0..4 are not played)
         let v = pull_frame(&mut jb, &mut dec);
-        assert!(v >= 30.0 || v == -1.0 || v.fract() == 0.25, "canlı uca atlamalıydı, geldi: {v}");
+        assert!(v >= 30.0 || v == -1.0 || v.fract() == 0.25, "should jump to the live edge, got: {v}");
         assert!(jb.stats.resyncs >= 1);
     }
 
@@ -507,18 +610,18 @@ mod tests {
         for k in 0..4u32 {
             jb.push(k, pkt(k));
         }
-        // 4 gerçek çerçeve + plc_limit(6) PLC + sonrasında underrun
+        // 4 real frames + plc_limit (6) PLC frames, then underrun
         for _ in 0..12 {
             pull_frame(&mut jb, &mut dec);
         }
         assert_eq!(jb.state(), State::Buffering);
         assert_eq!(jb.stats.underruns, 1);
-        assert!(jb.target_ms() > t0, "hedef artmalıydı: {} → {}", t0, jb.target_ms());
-        // Akış çok ileriden devam ediyor (istemci göndermeye devam etmişti)
+        assert!(jb.target_ms() > t0, "target should rise: {} → {}", t0, jb.target_ms());
+        // The stream continues much further on (the client kept sending)
         for k in 30..40u32 {
             jb.push(k, pkt(k));
         }
-        // Yeterli doluluk → tekrar çalmaya başlar, 30'dan devam eder
+        // Enough fill → playing again, continuing from 30
         let v = pull_frame(&mut jb, &mut dec);
         assert_eq!(v, 30.0);
         assert_eq!(jb.state(), State::Playing);
@@ -532,7 +635,7 @@ mod tests {
         let mut dec = Mock;
         let t0 = jb.target_ms();
         let mut next_push = 0u32;
-        // Doluluğu hedefin üstünde tutarak 2+ saniye temiz oynat
+        // Play 2+ seconds cleanly while keeping the fill above the target
         for _ in 0..8u32 {
             jb.push(next_push, pkt(next_push));
             next_push += 1;
@@ -542,7 +645,7 @@ mod tests {
             next_push += 1;
             pull_frame(&mut jb, &mut dec);
         }
-        assert!(jb.target_ms() < t0, "hedef düşmeliydi: {} → {}", t0, jb.target_ms());
+        assert!(jb.target_ms() < t0, "target should drop: {} → {}", t0, jb.target_ms());
         assert_eq!(jb.stats.underruns, 0);
     }
 
@@ -552,7 +655,7 @@ mod tests {
         for k in 0..2000u32 {
             jb.push(k, pkt(k));
         }
-        assert!(jb.fill_ms() <= 400, "doluluk {}ms > 400ms", jb.fill_ms());
+        assert!(jb.fill_ms() <= 400, "fill {}ms > 400ms", jb.fill_ms());
         assert!(jb.stats.resyncs > 0);
     }
 
@@ -570,5 +673,72 @@ mod tests {
         }
         assert_eq!(jb.stats.resyncs, 0);
         assert_eq!(jb.stats.late, 0);
+    }
+
+    /// Jittery network model: packet k is sent at k*20 ms and arrives after a
+    /// random 0..jitter_ms delay (so reordering happens). The consumer pulls
+    /// 10 ms per tick and, like the supervisor's drift servo, nudges its speed
+    /// once per second to keep the fill near the target.
+    fn simulate(jitter_ms: f64, seconds: u32, seed: u64) -> JitterBuffer {
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        let mut dec = Mock;
+        let mut x = seed.max(1);
+        let mut rand = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let frames = seconds * 50;
+        let mut arrivals: Vec<(f64, u32)> =
+            (0..frames).map(|k| (k as f64 * 20.0 + rand() * jitter_ms, k)).collect();
+        arrivals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let (mut ai, mut now, mut tick) = (0usize, 0f64, 0u32);
+        let (mut adj, mut carry) = (0f64, 0f64);
+        let mut buf = Vec::new();
+        while now < seconds as f64 * 1000.0 {
+            now += 10.0;
+            tick += 1;
+            while ai < arrivals.len() && arrivals[ai].0 <= now {
+                jb.push(arrivals[ai].1, pkt(arrivals[ai].1));
+                ai += 1;
+            }
+            if tick % 100 == 0 {
+                let raw = ((jb.avg_fill_ms() as f64 - jb.target_ms() as f64) * 100.0).clamp(-3000.0, 3000.0);
+                adj = if jb.state() == State::Playing { 0.7 * adj + 0.3 * raw * 1e-6 } else { 0.0 };
+            }
+            let want = 480.0 * (1.0 + adj) + carry;
+            carry = want - want.floor();
+            buf.resize(want.floor() as usize, 0.0);
+            jb.pull(&mut buf, &mut dec);
+        }
+        jb
+    }
+
+    #[test]
+    fn jittery_network_is_absorbed_not_dropped() {
+        // 60 ms of jitter with zero real loss: nothing should be thrown away,
+        // and only a sliver of the audio may be synthesized.
+        let jb = simulate(60.0, 120, 3);
+        let st = jb.stats;
+        assert!(
+            st.concealed_ratio() < 0.01 && st.late < 20 && st.underruns == 0,
+            "concealed {:.2}% (plc {} fec {}), late {}, underruns {}",
+            st.concealed_ratio() * 100.0,
+            st.plc_frames,
+            st.fec_recovered,
+            st.late,
+            st.underruns
+        );
+        // The price is latency, and it should stay sane
+        assert!(jb.target_ms() <= 160, "target ran away: {} ms", jb.target_ms());
+    }
+
+    #[test]
+    fn clean_network_keeps_latency_at_the_floor() {
+        // USB / a perfect network: the buffer must settle at the minimum.
+        let jb = simulate(0.0, 90, 1);
+        assert_eq!(jb.target_ms(), JitterConfig::default().min_target_ms);
+        assert_eq!(jb.stats.plc_frames, 0);
     }
 }

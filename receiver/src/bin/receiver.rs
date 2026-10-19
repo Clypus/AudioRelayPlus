@@ -1,9 +1,9 @@
-//! arp-receiver — AudioRelayPlus PC alıcısı (komut satırı).
+//! arp-receiver — AudioRelayPlus PC receiver (command line).
 //!
-//! Telefondan gelen ses akışını alır, adaptif jitter tamponundan geçirip
-//! seçilen ses aygıtına verir. `--headless` modunda ses aygıtı yerine
-//! duvar saati ile tüketir (test/CI için, `--dump` ile wav kaydı).
-//! Pencereli sürüm için: arp-gui.
+//! Takes the stream coming from the phone, runs it through the adaptive
+//! jitter buffer and plays it on the chosen sound device. With `--headless`
+//! it consumes the audio on the wall clock instead of a sound device
+//! (tests/CI; `--dump` records a wav). The windowed version is arp-gui.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -12,50 +12,57 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arp::engine::{self, AudioCtl, Engine, EventLog, Shared};
+use arp::engine::{self, AudioCtl, Engine, EventLog, NetCtx, OutputManager, Shared};
 use arp::protocol as proto;
 use arp::resampler::Resampler;
 use arp::soundpad::Soundpad;
+use arp::t;
 
 #[derive(Parser, Debug)]
-#[command(name = "arp-receiver", version, about = "AudioRelayPlus PC alıcısı")]
+#[command(name = "arp-receiver", version, about = "AudioRelayPlus PC receiver")]
 struct Args {
-    /// Dinlenecek port (UDP=Wi-Fi ve TCP=USB, ikisi de bu port)
+    /// Port to listen on (UDP = Wi-Fi and TCP = USB, both on this port)
     #[arg(long, default_value_t = proto::DEFAULT_PORT)]
     port: u16,
-    /// Çıkış aygıtı adı (alt dizgi eşleşmesi, örn. "cable" veya "pulse")
+    /// Output device name (substring match, e.g. "cable" or "pulse")
     #[arg(long)]
     device: Option<String>,
-    /// Ses aygıtlarını listele ve çık
+    /// List the sound devices and exit
     #[arg(long)]
     list_devices: bool,
-    /// Keşifte görünecek PC adı
+    /// PC name shown in the phone's list
     #[arg(long)]
     name: Option<String>,
-    /// Başlangıç hedef gecikmesi (ms)
+    /// Initial target delay (ms)
     #[arg(long, default_value_t = 60)]
     target_ms: u32,
-    /// Ses aygıtı yok: duvar saatiyle tüket (test modu)
+    /// No sound device: consume on the wall clock (test mode)
     #[arg(long)]
     headless: bool,
-    /// Çalınan sesi wav dosyasına yaz (yalnızca --headless)
+    /// Write what is played to a wav file (--headless only)
     #[arg(long)]
     dump: Option<PathBuf>,
-    /// --headless süre (saniye, 0 = sınırsız)
+    /// --headless duration in seconds (0 = unlimited)
     #[arg(long, default_value_t = 0)]
     duration: u64,
-    /// Periyodik istatistik satırını gizle
+    /// Hide the periodic stats line
     #[arg(long)]
     quiet: bool,
-    /// Çıkış kazancı (1.0 = dokunma; yumuşak sınırlayıcı ile)
+    /// Output gain (1.0 = untouched; with a soft limiter)
     #[arg(long, default_value_t = 1.0)]
     gain: f32,
-    /// Yankı iptali (deneysel): hoparlör loopback'i referans alınır
+    /// AI noise suppression (RNNoise)
+    #[arg(long)]
+    denoise: bool,
+    /// Echo cancellation (experimental): the speaker loopback is the reference
     #[arg(long)]
     aec: bool,
-    /// Soundpad klasörü (mp3/ogg/wav/flac)
+    /// Soundpad folder (mp3/ogg/wav/flac), watched for changes
     #[arg(long, default_value = "soundpad")]
     soundpad: PathBuf,
+    /// Plug-and-play USB: keep an `adb reverse` tunnel on attached phones
+    #[arg(long)]
+    auto_usb: bool,
 }
 
 fn run_headless(
@@ -105,7 +112,13 @@ fn run_headless(
     }
     if let Some(w) = writer {
         w.finalize()?;
-        println!("💾 kayıt tamamlandı: {}", dump.unwrap().display());
+        let path = dump.unwrap();
+        let path = path.display();
+        println!("{}", t!("💾 recording saved: {path}", "💾 kayıt tamamlandı: {path}"));
+    }
+    // A session still running at the end gets its summary too
+    if let Some(s) = shared.lock().unwrap().session.as_ref() {
+        println!("{}", s.summary());
     }
     Ok(())
 }
@@ -114,7 +127,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.list_devices {
-        println!("Çıkış aygıtları:");
+        println!("{}", t!("Output devices:", "Çıkış aygıtları:"));
         for name in engine::list_output_devices() {
             println!("  • {name}");
         }
@@ -122,33 +135,41 @@ fn main() -> Result<()> {
     }
 
     let name = args.name.clone().unwrap_or_else(engine::default_name);
-    let sock = std::net::UdpSocket::bind(("0.0.0.0", args.port))
-        .with_context(|| format!("UDP {} portu açılamadı", args.port))?;
-    println!("🎧 AudioRelayPlus alıcısı: UDP+TCP {} dinleniyor, ad: \"{}\"", args.port, name);
+    let port = args.port;
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", port))
+        .with_context(|| t!("couldn't open UDP port {port}", "UDP {port} portu açılamadı"))?;
+    println!(
+        "{}",
+        t!(
+            "🎧 AudioRelayPlus receiver: listening on UDP+TCP {port}, name: \"{name}\"",
+            "🎧 AudioRelayPlus alıcısı: UDP+TCP {port} dinleniyor, ad: \"{name}\""
+        )
+    );
 
     let shared: Shared = Arc::new(Mutex::new(Engine::default()));
     let adj_ppm = Arc::new(AtomicI32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let log = EventLog::new(true); // CLI: her şey stdout'a
+    let log = EventLog::new(true); // CLI: everything goes to stdout
 
-    let pad = Arc::new(if args.soundpad.is_dir() {
-        Soundpad::load_dir(&args.soundpad, &log)
-    } else {
-        Soundpad::empty()
-    });
+    let pad = Arc::new(Soundpad::load_dir(&args.soundpad, &log));
+    pad.spawn_watcher(log.clone());
     let ctl = AudioCtl::new(pad.clone());
     ctl.set_gain(args.gain);
+    if args.denoise {
+        ctl.dsp.lock().unwrap().set_denoise(true);
+        println!("{}", t!("✨ noise suppression on (RNNoise)", "✨ gürültü engelleme açık (RNNoise)"));
+    }
 
-    // Yankı iptali: loopback referans akışı yaşadığı sürece etkin
+    // Echo cancellation: active while the loopback reference stream lives
     let _loopback = if args.aec {
         match arp::aec::spawn_loopback_reference(&log) {
             Ok((stream, ring)) => {
-                *ctl.aec.lock().unwrap() = Some(arp::aec::Aec::new(ring));
-                println!("🔇 yankı iptali etkin (deneysel)");
+                ctl.dsp.lock().unwrap().set_aec(Some(arp::aec::Aec::new(ring)));
+                println!("{}", t!("🔇 echo cancellation on (experimental)", "🔇 yankı engelleme açık (deneysel)"));
                 Some(stream)
             }
             Err(e) => {
-                eprintln!("⚠ yankı iptali açılamadı: {e}");
+                eprintln!("{}", t!("⚠ couldn't start echo cancellation: {e}", "⚠ yankı engelleme açılamadı: {e}"));
                 None
             }
         }
@@ -156,18 +177,20 @@ fn main() -> Result<()> {
         None
     };
 
-    engine::spawn_net(sock, shared.clone(), name.clone(), args.target_ms, log.clone(), pad.clone());
-    if let Err(e) = engine::spawn_tcp(args.port, shared.clone(), name, args.target_ms, log.clone(), pad.clone()) {
-        eprintln!("⚠ USB/TCP dinleyicisi açılamadı: {e}");
+    let ctx = NetCtx::new(shared.clone(), name, port, args.target_ms, log.clone(), pad.clone());
+    engine::spawn_net(sock, ctx.clone());
+    if let Err(e) = engine::spawn_tcp(ctx) {
+        eprintln!("{}", t!("⚠ couldn't start the USB/TCP listener: {e}", "⚠ USB/TCP dinleyicisi açılamadı: {e}"));
     }
-    engine::spawn_supervisor(shared.clone(), adj_ppm.clone(), log.clone(), !args.quiet);
+    engine::spawn_supervisor(shared.clone(), adj_ppm.clone(), log.clone(), pad.clone(), !args.quiet);
+    let _usb = args.auto_usb.then(|| arp::usb::spawn(port, true, log.clone()));
 
     if args.headless {
         run_headless(shared, adj_ppm, ctl, args.dump.clone(), args.duration, stop)?;
     } else {
-        let (_stream, desc) = engine::run_audio(shared, adj_ppm, &args.device, ctl)?;
-        println!("🔊 çıkış: {desc}");
-        println!("hazır — telefondan bağlanabilirsiniz (çıkış: Ctrl-C)");
+        let output = OutputManager::spawn(t!("output", "çıkış"), engine::mic_render(shared, adj_ppm, ctl), log);
+        output.open(args.device.clone());
+        println!("{}", t!("ready — connect from the phone (quit: Ctrl-C)", "hazır — telefondan bağlanabilirsiniz (çıkış: Ctrl-C)"));
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }

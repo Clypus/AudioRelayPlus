@@ -1,13 +1,14 @@
 #!/bin/bash
-# AudioRelayPlus — Linux (PipeWire/PulseAudio) sanal mikrofon kurulumu.
+# AudioRelayPlus — Linux (PipeWire/PulseAudio) virtual microphone setup.
 #
-# "AudioRelayPlus Mic" adında bir sanal mikrofon oluşturur ve arp-receiver'ı
-# çıkışını ona verecek şekilde başlatır. Discord/oyunlarda mikrofon olarak
-# "AudioRelayPlus Mic" seçin. Script kapanınca (Ctrl-C) sanal aygıt kaldırılır.
+# Creates a virtual microphone called "AudioRelayPlus Mic" and starts
+# arp-receiver with its output going into it. Pick "AudioRelayPlus Mic" as
+# the microphone in Discord/games. The virtual device is removed when the
+# script exits (Ctrl-C). (arp-gui does the same with one checkbox.)
 #
-# Tarif (test edildi): null-sink + remap-source + PULSE_SINK + --device pulse
+# Recipe (tested): null-sink + remap-source + PULSE_SINK + --device pulse
 #
-# Kullanım: ./linux-virtual-mic.sh [arp-receiver'a geçecek ek argümanlar]
+# Usage: ./linux-virtual-mic.sh [extra arguments for arp-receiver]
 set -euo pipefail
 
 SINK="arp_sink"
@@ -26,12 +27,12 @@ find_receiver() {
 
 RECEIVER="$(find_receiver)"
 if [ -z "$RECEIVER" ]; then
-  echo "HATA: arp-receiver bulunamadı. Önce derleyin: cd receiver && cargo build --release" >&2
+  echo "ERROR: arp-receiver not found. Build it first: cd receiver && cargo build --release" >&2
   exit 1
 fi
 
 if ! command -v pactl >/dev/null; then
-  echo "HATA: pactl yok (pipewire-pulse ya da pulseaudio gerekli)" >&2
+  echo "ERROR: pactl is missing (pipewire-pulse or pulseaudio is required)" >&2
   exit 1
 fi
 
@@ -40,20 +41,20 @@ cleanup() {
   for m in "${MODULES[@]:-}"; do
     [ -n "$m" ] && pactl unload-module "$m" 2>/dev/null || true
   done
-  echo "sanal mikrofon kaldırıldı"
+  echo "virtual microphone removed"
 }
 trap cleanup EXIT
 
 if ! pactl list short sinks | awk '{print $2}' | grep -qx "$SINK"; then
   MODULES+=("$(pactl load-module module-null-sink sink_name="$SINK" \
-      sink_properties="device.description='ARP-Ara-Cikis'")")
+      sink_properties="device.description='ARP-Internal-Output'")")
 fi
 if ! pactl list short sources | awk '{print $2}' | grep -qx "$SOURCE"; then
   MODULES+=("$(pactl load-module module-remap-source master="$SINK.monitor" \
       source_name="$SOURCE" source_properties="device.description='$DESC'")")
 fi
 
-echo "sanal mikrofon hazır: \"$DESC\""
-echo "→ Discord/oyun ayarlarında giriş aygıtı olarak \"$DESC\" seçin."
-echo "→ Alıcı başlatılıyor; telefondan bağlanabilirsiniz. Çıkış: Ctrl-C"
-PULSE_SINK="$SINK" "$RECEIVER" --device pulse "$@"
+echo "virtual microphone ready: \"$DESC\""
+echo "→ pick \"$DESC\" as the input device in Discord/games."
+echo "→ starting the receiver; connect from the phone (Wi-Fi, or USB with adb). Quit: Ctrl-C"
+PULSE_SINK="$SINK" "$RECEIVER" --device pulse --auto-usb "$@"

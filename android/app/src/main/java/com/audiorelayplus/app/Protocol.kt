@@ -3,9 +3,9 @@ package com.audiorelayplus.app
 import java.nio.ByteBuffer
 
 /**
- * AudioRelayPlus v1 kablo formatı — PROTOCOL.md ile birebir.
- * ByteBuffer varsayılanı big-endian olduğundan başlık alanları doğrudan uyar;
- * PCM örnekleri (yalnızca PCM16 codec'inde) little-endian yazılır.
+ * AudioRelayPlus v1 wire format — matches PROTOCOL.md exactly.
+ * ByteBuffer is big-endian by default, so header fields map directly;
+ * PCM samples (PCM16 codec only) are written little-endian.
  */
 object Protocol {
     const val VERSION: Byte = 1
@@ -42,7 +42,7 @@ object Protocol {
         header(T_HELLO, 11)
             .putInt(session)
             .putInt(SAMPLE_RATE)
-            .put(1) // kanal
+            .put(1) // channels
             .put(codec)
             .put(frameMs.toByte())
             .array()
@@ -68,18 +68,18 @@ object Protocol {
     fun soundStop(session: Int): ByteArray =
         header(T_SOUND_STOP, 4).putInt(session).array()
 
-    /** USB/TCP çerçevesi: [uzunluk u16 BE][paket]. */
+    /** USB/TCP framing: [length u16 BE][packet]. */
     fun tcpFrame(pkt: ByteArray): ByteArray =
         ByteBuffer.allocate(2 + pkt.size).putShort(pkt.size.toShort()).put(pkt).array()
 
-    /** SOUND_LIST gövdesini çözer. */
+    /** Decodes a SOUND_LIST body. */
     fun parseSoundList(body: ByteBuffer): List<String> {
         val out = ArrayList<String>()
         if (body.remaining() < 1) return out
         val count = body.get().toInt() and 0xff
         repeat(count) {
             if (body.remaining() < 2) return out
-            body.get() // id (sıra ile aynı)
+            body.get() // id (same as the list position)
             val len = body.get().toInt() and 0xff
             if (body.remaining() < len) return out
             val b = ByteArray(len)
@@ -89,7 +89,22 @@ object Protocol {
         return out
     }
 
-    /** Başlık geçerliyse tip + gövdeye konumlanmış buffer döner. */
+    /** A decoded DISCOVER_REPLY: the PC's name and its audio port. */
+    class DiscoverReply(val name: String, val port: Int)
+
+    /** Decodes a DISCOVER_REPLY body; null if it's malformed or answers another nonce. */
+    fun parseDiscoverReply(body: ByteBuffer, nonce: Int): DiscoverReply? {
+        if (body.remaining() < 7) return null
+        if (body.int != nonce) return null
+        val port = body.short.toInt() and 0xffff
+        val nameLen = body.get().toInt() and 0xff
+        if (body.remaining() < nameLen) return null
+        val nameBytes = ByteArray(nameLen)
+        body.get(nameBytes)
+        return DiscoverReply(String(nameBytes, Charsets.UTF_8), port)
+    }
+
+    /** If the header is valid: the type plus a buffer positioned at the body. */
     class Parsed(val type: Byte, val body: ByteBuffer)
 
     fun parse(data: ByteArray, len: Int): Parsed? {

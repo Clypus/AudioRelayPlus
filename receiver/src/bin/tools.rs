@@ -1,9 +1,12 @@
-//! arp-tools — geliştirme/test araçları.
+//! arp-tools — development/test tools.
 //!
-//! `send`    : sinüs dalgasını Opus/PCM ile kodlayıp alıcıya yollar; kayıp,
-//!             jitter (yeniden sıralama dahil) ve saat kayması simüle eder.
-//! `analyze` : alıcının `--dump` çıktısındaki wav'da kesinti (sessizlik
-//!             boşluğu) ve klik arar — "kesik kesik" için objektif ölçüm.
+//! `send`    : encodes a sine wave with Opus/PCM and streams it to the
+//!             receiver, simulating loss, jitter (incl. reordering), Wi-Fi
+//!             stalls and clock drift.
+//! `analyze` : looks for dropouts (silent gaps) and clicks in the wav the
+//!             receiver wrote with `--dump` — an objective "choppy" check.
+//!             Note that it can't see concealment (PLC/FEC) on a sine: read
+//!             the receiver's session summary for that.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -16,7 +19,7 @@ use std::time::{Duration, Instant};
 use arp::protocol as proto;
 
 #[derive(Parser)]
-#[command(name = "arp-tools", version, about = "AudioRelayPlus test araçları")]
+#[command(name = "arp-tools", version, about = "AudioRelayPlus test tools")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -24,62 +27,69 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Simüle ağ koşullarında test sesi gönder
+    /// Send a test tone under simulated network conditions
     Send(SendArgs),
-    /// Kaydedilen wav'da kesinti/klik analizi yap
+    /// Analyze a recorded wav for dropouts and clicks
     Analyze(AnalyzeArgs),
 }
 
 #[derive(Parser, Debug)]
 struct SendArgs {
-    /// Alıcı adresi
+    /// Receiver address
     #[arg(long, default_value = "127.0.0.1:48222")]
     target: String,
     /// Codec: opus | pcm
     #[arg(long, default_value = "opus")]
     codec: String,
-    /// Süre (saniye)
+    /// Duration (seconds)
     #[arg(long, default_value_t = 10.0)]
     duration: f64,
-    /// Paket kaybı yüzdesi (0-100)
+    /// Packet loss percentage (0-100)
     #[arg(long, default_value_t = 0.0)]
     loss: f64,
-    /// Pakete eklenen rastgele gecikme üst sınırı (ms) — yeniden sıralamaya yol açar
+    /// Upper bound of the random per-packet delay (ms) — causes reordering
     #[arg(long, default_value_t = 0.0)]
     jitter: f64,
-    /// Gönderici saat kayması (ppm; +200 = telefon saati %0,02 hızlı)
+    /// Every this many seconds, hold all packets back (a Wi-Fi power-save /
+    /// scan stall); they then arrive in one burst. 0 = off
+    #[arg(long, default_value_t = 0.0)]
+    spike_every: f64,
+    /// Length of such a stall (ms)
+    #[arg(long, default_value_t = 150.0)]
+    spike_ms: f64,
+    /// Sender clock drift (ppm; +200 = the phone's clock runs 0.02% fast)
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     drift_ppm: f64,
     /// Opus bitrate (b/s)
     #[arg(long, default_value_t = 64000)]
     bitrate: i32,
-    /// Test tonu frekansı (Hz)
+    /// Test tone frequency (Hz)
     #[arg(long, default_value_t = 440.0)]
     freq: f64,
-    /// Rastgelelik tohumu (tekrarlanabilir testler için)
+    /// Random seed (for repeatable tests)
     #[arg(long, default_value_t = 1)]
     seed: u64,
-    /// UDP yerine TCP kullan (USB/adb yolunun testi; kayıp/jitter yok sayılır)
+    /// Use TCP instead of UDP (tests the USB/adb path; loss/jitter are ignored)
     #[arg(long)]
     tcp: bool,
 }
 
 #[derive(Parser, Debug)]
 struct AnalyzeArgs {
-    /// İncelenecek wav dosyası
+    /// The wav file to inspect
     wav: PathBuf,
-    /// Baştan atlanacak süre (başlangıç tamponlaması, ms)
+    /// Skip this much at the start (initial buffering, ms)
     #[arg(long, default_value_t = 1000)]
     skip_ms: u64,
-    /// Sondan atlanacak süre (ms)
+    /// Skip this much at the end (ms)
     #[arg(long, default_value_t = 300)]
     tail_ms: u64,
-    /// Bu süreden uzun sessizlik = KESİNTİ sayılır (ms)
+    /// Silence longer than this counts as a DROPOUT (ms)
     #[arg(long, default_value_t = 20.0)]
     gap_ms: f64,
 }
 
-/// xorshift64* — bağımlılıksız, tohumlu RNG
+/// xorshift64* — dependency-free seeded RNG
 struct Rng(u64);
 
 impl Rng {
@@ -99,7 +109,7 @@ impl Rng {
     }
 }
 
-/// Gönderim + ACK okuma soyutlaması: UDP datagram ya da TCP çerçeve.
+/// Send + read-ACK abstraction: a UDP datagram or a TCP frame.
 enum Link {
     Udp(UdpSocket),
     Tcp(std::net::TcpStream),
@@ -116,7 +126,7 @@ impl Link {
         }
     }
 
-    /// Bir paket okumaya çalışır (zaman aşımı ayarına tabi, bloklar).
+    /// Tries to read one packet (blocks, subject to the read timeout).
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Link::Udp(s) => s.recv(buf),
@@ -126,7 +136,7 @@ impl Link {
                 s.read_exact(&mut hdr)?;
                 let len = u16::from_be_bytes(hdr) as usize;
                 if len > buf.len() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "çerçeve büyük"));
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too big"));
                 }
                 s.read_exact(&mut buf[..len])?;
                 Ok(len)
@@ -153,29 +163,29 @@ fn cmd_send(a: SendArgs) -> Result<()> {
     let codec = match a.codec.as_str() {
         "opus" => proto::Codec::Opus,
         "pcm" => proto::Codec::Pcm16,
-        other => return Err(anyhow!("bilinmeyen codec: {other}")),
+        other => return Err(anyhow!("unknown codec: {other}")),
     };
     let frame_samples = codec.frame_samples();
     let frame_ms = frame_samples as f64 * 1000.0 / proto::SAMPLE_RATE as f64;
-    if a.tcp && (a.loss > 0.0 || a.jitter > 0.0) {
-        eprintln!("not: --tcp modunda kayıp/jitter simülasyonu uygulanmaz");
+    if a.tcp && (a.loss > 0.0 || a.jitter > 0.0 || a.spike_every > 0.0) {
+        eprintln!("note: loss/jitter/stall simulation does not apply with --tcp");
     }
 
     let mut link = if a.tcp {
         let s = std::net::TcpStream::connect(&a.target)
-            .with_context(|| format!("TCP hedefe bağlanılamadı: {}", a.target))?;
+            .with_context(|| format!("couldn't connect over TCP: {}", a.target))?;
         s.set_nodelay(true)?;
         Link::Tcp(s)
     } else {
         let sock = UdpSocket::bind("0.0.0.0:0")?;
-        sock.connect(&a.target).with_context(|| format!("hedefe bağlanılamadı: {}", a.target))?;
+        sock.connect(&a.target).with_context(|| format!("couldn't reach: {}", a.target))?;
         Link::Udp(sock)
     };
 
     let mut rng = Rng::new(a.seed);
     let session: u32 = (rng.next_u64() >> 32) as u32;
 
-    // HELLO / HELLO_ACK el sıkışması
+    // HELLO / HELLO_ACK handshake
     let hello = proto::build_hello(&proto::Hello {
         session,
         sample_rate: proto::SAMPLE_RATE,
@@ -197,20 +207,20 @@ fn cmd_send(a: SendArgs) -> Result<()> {
             }
         }
         if i == 9 {
-            return Err(anyhow!("alıcı yanıt vermedi (HELLO_ACK yok)"));
+            return Err(anyhow!("the receiver did not answer (no HELLO_ACK)"));
         }
     }
     assert!(connected);
     println!(
-        "bağlandı: {} ({}, codec={:?}, session={session:08x})",
+        "connected: {} ({}, codec={:?}, session={session:08x})",
         a.target,
         if a.tcp { "TCP" } else { "UDP" },
         codec
     );
 
-    // ACK okuyucu iş parçacığı (RTT ölçümü) — TCP'de çerçeve senkronu için şart
+    // ACK reader thread (RTT measurement) — over TCP it also keeps the framing in sync
     let t0 = Instant::now();
-    let ack_stats = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0f64))); // (hb_acks, rtt_toplam_ms)
+    let ack_stats = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0f64))); // (hb_acks, rtt_sum_ms)
     {
         let mut rlink = link.try_clone()?;
         rlink.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -247,7 +257,7 @@ fn cmd_send(a: SendArgs) -> Result<()> {
     };
 
     let n_frames = (a.duration * 1000.0 / frame_ms).round() as u32;
-    // drift > 0: gönderici saati hızlı → çerçeveler gerçek 20 ms'den KISA aralıkla gelir
+    // drift > 0: the sender's clock is fast → frames come SHORTER than 20 ms apart
     let interval = Duration::from_secs_f64(frame_ms / 1000.0 * (1.0 - a.drift_ppm * 1e-6));
 
     let mut phase = 0f64;
@@ -256,6 +266,7 @@ fn cmd_send(a: SendArgs) -> Result<()> {
     let mut ebuf = vec![0u8; 1500];
 
     let (loss, jitter) = if a.tcp { (0.0, 0.0) } else { (a.loss, a.jitter) };
+    let (spike_every, spike_ms) = if a.tcp { (0.0, 0.0) } else { (a.spike_every, a.spike_ms) };
     let mut heap: BinaryHeap<Reverse<(Instant, u64, Vec<u8>)>> = BinaryHeap::new();
     let mut heap_ctr = 0u64;
     let mut k = 0u32;
@@ -265,7 +276,7 @@ fn cmd_send(a: SendArgs) -> Result<()> {
     while k < n_frames || !heap.is_empty() {
         let now = Instant::now();
 
-        // Sırası gelen çerçeveleri üret
+        // Produce the frames that are due
         while k < n_frames && t0 + interval * k <= now {
             for s in pcm.iter_mut() {
                 *s = (phase.sin() * 0.5 * 32767.0) as i16;
@@ -283,20 +294,30 @@ fn cmd_send(a: SendArgs) -> Result<()> {
                 sim_dropped += 1;
             } else {
                 let delay = Duration::from_secs_f64(rng.unit() * jitter / 1000.0);
-                heap.push(Reverse((now + delay, heap_ctr, pkt)));
+                let mut when = now + delay;
+                // Inside a stall window nothing gets through until it ends
+                if spike_every > 0.0 {
+                    let t = now.duration_since(t0).as_secs_f64();
+                    let into = t % spike_every;
+                    if t >= spike_every && into < spike_ms / 1000.0 {
+                        let end = now + Duration::from_secs_f64(spike_ms / 1000.0 - into);
+                        when = when.max(end);
+                    }
+                }
+                heap.push(Reverse((when, heap_ctr, pkt)));
                 heap_ctr += 1;
             }
             k += 1;
         }
 
-        // Kalp atışı (kayıpsız/jittersız gönderilir; canlılık kanalı)
+        // Heartbeat (sent without loss/jitter; it is the liveness channel)
         if last_hb.elapsed() >= Duration::from_millis(500) {
             last_hb = Instant::now();
             let ms = t0.elapsed().as_millis() as u32;
             let _ = link.send(&proto::build_heartbeat(session, ms));
         }
 
-        // Zamanı gelen paketleri gönder
+        // Send the packets whose time has come
         while let Some(Reverse((when, _, _))) = heap.peek() {
             if *when <= Instant::now() {
                 let Reverse((_, _, pkt)) = heap.pop().unwrap();
@@ -317,7 +338,7 @@ fn cmd_send(a: SendArgs) -> Result<()> {
 
     let (hb_acks, rtt_sum_ms) = *ack_stats.lock().unwrap();
     println!(
-        "bitti: {} çerçeve üretildi, {} gönderildi, {} simüle kayıp (%{:.1}), {} hb-ack, ort. RTT {:.1} ms",
+        "done: {} frames produced, {} sent, {} dropped by the simulation ({:.1}%), {} hb-acks, avg RTT {:.1} ms",
         n_frames,
         sent,
         sim_dropped,
@@ -332,7 +353,7 @@ fn cmd_analyze(a: AnalyzeArgs) -> Result<()> {
     let mut reader = hound::WavReader::open(&a.wav)?;
     let spec = reader.spec();
     if spec.channels != 1 {
-        return Err(anyhow!("mono wav bekleniyordu ({} kanal geldi)", spec.channels));
+        return Err(anyhow!("expected a mono wav (got {} channels)", spec.channels));
     }
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
@@ -344,8 +365,8 @@ fn cmd_analyze(a: AnalyzeArgs) -> Result<()> {
     let rate = spec.sample_rate as u64;
     let skip = (a.skip_ms * rate / 1000) as usize;
     let tail = (a.tail_ms * rate / 1000) as usize;
-    // Yayın bittikten sonraki doğal sessizliği kesinti sayma: sondaki
-    // sessizliği kırp, son aktif örneğe kadar incele.
+    // The natural silence after the stream ended is not a dropout: trim the
+    // trailing silence and inspect up to the last active sample.
     const SILENCE: f32 = 1e-5;
     let active_end = samples
         .iter()
@@ -354,12 +375,12 @@ fn cmd_analyze(a: AnalyzeArgs) -> Result<()> {
         .unwrap_or(0);
     let end = active_end.saturating_sub(tail).min(samples.len());
     if end <= skip {
-        return Err(anyhow!("incelenecek aktif ses yok (aktif bölüm {} örnek)", active_end));
+        return Err(anyhow!("no active audio to inspect (active part: {} samples)", active_end));
     }
     let region = &samples[skip..end];
     let ms = |n: usize| n as f64 * 1000.0 / rate as f64;
 
-    let mut gaps: Vec<(usize, usize)> = Vec::new(); // (başlangıç, uzunluk)
+    let mut gaps: Vec<(usize, usize)> = Vec::new(); // (start, length)
     let mut run = 0usize;
     for (i, &s) in region.iter().enumerate() {
         if s.abs() <= SILENCE {
@@ -386,22 +407,22 @@ fn cmd_analyze(a: AnalyzeArgs) -> Result<()> {
     let bad: Vec<_> = gaps.iter().filter(|(_, n)| ms(*n) >= a.gap_ms).collect();
     let longest = gaps.iter().map(|(_, n)| *n).max().unwrap_or(0);
 
-    println!("dosya           : {} ({:.1} sn, {} Hz)", a.wav.display(), ms(samples.len()) / 1000.0, rate);
-    println!("incelenen bölge : {:.1} sn (baştan {} ms, sondan {} ms atlandı)", ms(region.len()) / 1000.0, a.skip_ms, a.tail_ms);
+    println!("file            : {} ({:.1} s, {} Hz)", a.wav.display(), ms(samples.len()) / 1000.0, rate);
+    println!("inspected       : {:.1} s ({} ms skipped at the start, {} ms at the end)", ms(region.len()) / 1000.0, a.skip_ms, a.tail_ms);
     println!("RMS             : {:.4}", rms);
-    println!("≥5ms sessizlik  : {} adet (en uzunu {:.1} ms)", gaps.len(), ms(longest));
-    println!("klik (ani atlama): {clicks}");
+    println!("≥5 ms silences  : {} (longest {:.1} ms)", gaps.len(), ms(longest));
+    println!("clicks (jumps)  : {clicks}");
     for (start, n) in &bad {
-        println!("  ❌ kesinti: {:.2} sn konumunda, {:.1} ms", (ms(*start) + a.skip_ms as f64) / 1000.0, ms(*n));
+        println!("  ❌ dropout at {:.2} s, {:.1} ms", (ms(*start) + a.skip_ms as f64) / 1000.0, ms(*n));
     }
     if bad.is_empty() && rms > 0.05 {
-        println!("SONUÇ: TEMİZ ✅ ({:.0} ms üzeri kesinti yok)", a.gap_ms);
+        println!("RESULT: CLEAN ✅ (no dropout over {:.0} ms)", a.gap_ms);
         Ok(())
     } else if rms <= 0.05 {
-        println!("SONUÇ: BAŞARISIZ ❌ (kayıtta ses yok gibi görünüyor, RMS={rms:.4})");
+        println!("RESULT: FAILED ❌ (the recording looks silent, RMS={rms:.4})");
         std::process::exit(1);
     } else {
-        println!("SONUÇ: KESİNTİLİ ❌ ({} adet {:.0} ms üzeri boşluk)", bad.len(), a.gap_ms);
+        println!("RESULT: CHOPPY ❌ ({} gap(s) over {:.0} ms)", bad.len(), a.gap_ms);
         std::process::exit(1);
     }
 }

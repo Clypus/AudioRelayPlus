@@ -1,0 +1,7 @@
+# Release signing material — never commit it
+keystore.properties
+*.jks
+*.keystore
+
+# Kotlin compiler session data
+.kotlin/

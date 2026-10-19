@@ -1,18 +1,19 @@
-//! Servo kontrollü lineer yeniden örnekleyici.
+//! Servo-controlled linear resampler.
 //!
-//! İki işi birden yapar:
-//! 1. Kaynak (48 kHz) ile ses aygıtının hızı farklıysa dönüştürür.
-//! 2. `set_adj_ppm` ile tampon doluluğuna bağlı mikro hız ayarı uygular —
-//!    telefon ve PC saatlerinin ppm farkını sürekli ve duyulmaz biçimde emer.
+//! Does two jobs at once:
+//! 1. Converts between the source rate (48 kHz) and the sound device's rate.
+//! 2. Applies a tiny speed adjustment via `set_adj_ppm`, driven by the buffer
+//!    fill — it continuously and inaudibly absorbs the ppm difference between
+//!    the phone's and the PC's clocks.
 
 use std::collections::VecDeque;
 
 pub struct Resampler {
     step_base: f64,
     adj: f64,
-    /// carry ile fifo[0] arasındaki kesirli konum.
+    /// Fractional position between `carry` and fifo[0].
     frac: f64,
-    /// Tüketilen son kaynak örneği (interpolasyon sol ucu).
+    /// Last consumed source sample (left end of the interpolation).
     carry: f32,
     fifo: VecDeque<f32>,
     scratch: Vec<f32>,
@@ -36,12 +37,12 @@ impl Resampler {
         self.fifo.clear();
     }
 
-    /// Pozitif ppm = kaynağı hızlı tüket (tamponu erit), negatif = yavaş tüket.
+    /// Positive ppm = consume the source faster (drain the buffer), negative = slower.
     pub fn set_adj_ppm(&mut self, ppm: f64) {
         self.adj = (ppm * 1e-6).clamp(-0.005, 0.005);
     }
 
-    /// `out`'u doldurur; eksik kaynak örneklerini `pull` ile ister.
+    /// Fills `out`, asking `pull` for the source samples it is missing.
     pub fn process(&mut self, out: &mut [f32], mut pull: impl FnMut(&mut [f32])) {
         if out.is_empty() {
             return;
@@ -93,7 +94,7 @@ mod tests {
         let mut src = ramp_source();
         let mut out = vec![0f32; 100];
         rs.process(&mut out, &mut src);
-        // Bir örneklik gecikmeyle birebir kopya: out[i] ≈ i-1 (out[0] = carry = 0)
+        // Exact copy delayed by one sample: out[i] ≈ i-1 (out[0] = carry = 0)
         for (i, &v) in out.iter().enumerate().skip(1) {
             assert!((v - (i as f32 - 1.0)).abs() < 1e-4, "i={i} v={v}");
         }
@@ -118,7 +119,7 @@ mod tests {
     #[test]
     fn consumption_rate_follows_adj() {
         let mut rs = Resampler::new(48000.0, 48000.0);
-        rs.set_adj_ppm(2000.0); // %0,2 hızlı tüketim
+        rs.set_adj_ppm(2000.0); // consume 0.2% faster
         let mut consumed = 0usize;
         let mut out = vec![0f32; 48000];
         rs.process(&mut out, |buf| {
@@ -127,7 +128,7 @@ mod tests {
                 *b = 0.5;
             }
         });
-        // 48000 çıkış için ~48096 kaynak tüketilmeli
+        // 48000 outputs should consume ~48096 source samples
         assert!((consumed as i64 - 48096).abs() < 4, "consumed={consumed}");
     }
 }

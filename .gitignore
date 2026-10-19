@@ -9,7 +9,7 @@
 *.apk
 !*.md
 
-# Editör / işletim sistemi
+# Editor / OS
 .idea/
 *.iml
 .DS_Store

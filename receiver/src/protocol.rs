@@ -1,4 +1,4 @@
-//! AudioRelayPlus v1 kablo formatı — bkz. PROTOCOL.md
+//! AudioRelayPlus v1 wire format — see PROTOCOL.md
 
 pub const MAGIC: [u8; 2] = *b"AR";
 pub const VERSION: u8 = 1;
@@ -124,11 +124,11 @@ pub fn parse(buf: &[u8]) -> Option<Packet<'_>> {
     }
 }
 
-fn header(tip: u8, cap: usize) -> Vec<u8> {
+fn header(kind: u8, cap: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + cap);
     v.extend_from_slice(&MAGIC);
     v.push(VERSION);
-    v.push(tip);
+    v.push(kind);
     v
 }
 
@@ -200,18 +200,17 @@ pub fn build_sound_list_req(session: u32) -> Vec<u8> {
     v
 }
 
-/// En fazla 32 ad; adlar 40 bayta kırpılır (tek UDP paketine sığsın).
+/// At most 32 names; each is cut to 40 bytes (so the list fits one UDP packet).
 pub fn build_sound_list(names: &[String]) -> Vec<u8> {
     let n = names.len().min(32);
     let mut v = header(10, 1 + n * 42);
     v.push(n as u8);
     for (i, name) in names.iter().take(n).enumerate() {
         let mut b = name.as_bytes();
-        while b.len() > 40 {
-            // UTF-8 sınırında kırp
+        if b.len() > 40 {
+            // cut on a UTF-8 character boundary
             let cut = (0..=40).rev().find(|&c| name.is_char_boundary(c)).unwrap_or(0);
-            b = &name.as_bytes()[..cut];
-            break;
+            b = &b[..cut];
         }
         v.push(i as u8);
         v.push(b.len() as u8);
@@ -233,7 +232,7 @@ pub fn build_sound_stop(session: u32) -> Vec<u8> {
     v
 }
 
-/// TCP çerçevesi: [uzunluk u16 BE][paket]. USB (adb) modunda kullanılır.
+/// TCP framing: [length u16 BE][packet]. Used for USB (adb) mode.
 pub fn tcp_frame(pkt: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(2 + pkt.len());
     v.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
@@ -252,7 +251,7 @@ mod tests {
             Some(Packet::Audio { session: 7, seq: 42, timestamp: 40320, payload }) => {
                 assert_eq!(payload, &[1, 2, 3]);
             }
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
@@ -261,36 +260,36 @@ mod tests {
         let h = Hello { session: 9, sample_rate: 48000, channels: 1, codec: Codec::Opus, frame_ms: 20 };
         match parse(&build_hello(&h)) {
             Some(Packet::Hello(g)) => assert_eq!(g, h),
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
-        match parse(&build_discover_reply(5, 48222, "Bilgisayarım")) {
+        match parse(&build_discover_reply(5, 48222, "Gaming PC — Çağrı'nın")) {
             Some(Packet::DiscoverReply { nonce: 5, port: 48222, name }) => {
-                assert_eq!(name, "Bilgisayarım");
+                assert_eq!(name, "Gaming PC — Çağrı'nın");
             }
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
     fn roundtrip_soundpad_packets() {
-        let names = vec!["harika bir ses".to_string(), "gülüş".to_string()];
+        let names = vec!["airhorn".to_string(), "rimshot ü".to_string()];
         match parse(&build_sound_list(&names)) {
             Some(Packet::SoundList { names: got }) => assert_eq!(got, names),
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
         match parse(&build_sound_play(7, 3)) {
             Some(Packet::SoundPlay { session: 7, id: 3 }) => {}
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
         match parse(&build_sound_list_req(9)) {
             Some(Packet::SoundListReq { session: 9 }) => {}
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
         match parse(&build_sound_stop(9)) {
             Some(Packet::SoundStop { session: 9 }) => {}
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
-        // TCP çerçevesi
+        // TCP framing
         let pkt = build_sound_play(1, 2);
         let framed = tcp_frame(&pkt);
         assert_eq!(u16::from_be_bytes([framed[0], framed[1]]) as usize, pkt.len());
@@ -299,13 +298,13 @@ mod tests {
 
     #[test]
     fn sound_list_truncates_long_names() {
-        let long = "ç".repeat(60); // çok baytlı: kırpma UTF-8 sınırında olmalı
+        let long = "ç".repeat(60); // multi-byte: the cut must land on a UTF-8 boundary
         match parse(&build_sound_list(&[long])) {
             Some(Packet::SoundList { names }) => {
                 assert!(names[0].len() <= 40);
                 assert!(names[0].chars().all(|c| c == 'ç'));
             }
-            other => panic!("beklenmeyen: {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 

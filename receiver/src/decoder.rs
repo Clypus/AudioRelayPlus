@@ -1,4 +1,4 @@
-//! Codec uygulamaları: Opus (FEC + PLC ile) ve düz PCM16.
+//! Codec implementations: Opus (with FEC + PLC) and raw PCM16.
 
 use crate::jitter::FrameDecoder;
 use anyhow::Result;
@@ -21,9 +21,9 @@ impl FrameDecoder for OpusDec {
     }
 
     fn decode_fec(&mut self, next_payload: &[u8], out: &mut [f32]) {
-        // fec=true: bir SONRAKİ paketin içindeki LBRR verisinden kayıp çerçeveyi üretir.
+        // fec=true: rebuild the lost frame from the LBRR data inside the NEXT packet.
         if self.dec.decode_float(next_payload, out, true).is_err() {
-            // FEC verisi yoksa libopus zaten PLC üretir; yine de hata olursa PLC dene.
+            // Without FEC data libopus already falls back to PLC; on error try PLC anyway.
             if self.dec.decode_float(&[], out, false).is_err() {
                 out.fill(0.0);
             }
@@ -31,14 +31,14 @@ impl FrameDecoder for OpusDec {
     }
 
     fn conceal(&mut self, out: &mut [f32]) {
-        // Boş girdi = paket kaybı → libopus PLC sentezi.
+        // Empty input = packet loss → libopus PLC synthesis.
         if self.dec.decode_float(&[], out, false).is_err() {
             out.fill(0.0);
         }
     }
 }
 
-/// PCM16'da FEC yok; gizleme, son çerçevenin sönümlenerek tekrarı.
+/// PCM16 has no FEC; concealment repeats the last frame, fading out.
 pub struct PcmDec {
     last: Vec<f32>,
 }

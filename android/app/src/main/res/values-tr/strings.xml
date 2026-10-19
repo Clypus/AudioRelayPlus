@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Main screen -->
+    <string name="scan">PC\'leri Tara</string>
+    <string name="connect">Bağlan</string>
+    <string name="stop">Durdur</string>
+    <string name="mic_on">Açık</string>
+    <string name="mic_muted">Sessiz</string>
+    <string name="manual_ip_hint">veya PC IP adresi gir (örn. 192.168.1.23)</string>
+    <string name="gain_label">Mikrofon seviyesi: %%%1$d</string>
+    <string name="noise_suppress">Gürültü azaltma</string>
+    <string name="phone_aec">Yankı eng. (telefon)</string>
+    <string name="auto_connect">Son PC\'ye otomatik bağlan</string>
+    <string name="soundpad">Soundpad (uzun bas: durdur)</string>
+    <string name="usb_label">USB kablo</string>
+
+    <!-- Status line -->
+    <string name="status_ready">hazır — PC\'de AudioRelayPlus alıcısı açık olmalı</string>
+    <string name="status_scanning">PC\'ler taranıyor…</string>
+    <string name="status_none_found">PC bulunamadı — alıcı açık mı, güvenlik duvarında UDP 48222 açık mı? IP ile de bağlanabilirsin.</string>
+    <plurals name="status_found">
+        <item quantity="one">%d PC bulundu, bağlanmak için dokun</item>
+        <item quantity="other">%d PC bulundu, bağlanmak için dokun</item>
+    </plurals>
+    <string name="status_connecting">bağlanıyor: %1$s…</string>
+    <string name="status_auto_connecting">otomatik bağlanıyor: %1$s…</string>
+    <string name="status_connected">bağlı ✓ %1$s</string>
+    <string name="status_link_lost">bağlantı koptu — yeniden deneniyor…</string>
+    <string name="status_pc_moved">PC yeni adreste (%1$s) — yeniden bağlanılıyor…</string>
+    <string name="status_usb_unavailable">USB bağlantısı yok — PC\'de alıcı açık mı, telefonda USB hata ayıklama açık mı?</string>
+    <string name="status_net_error">ağ hatası: %1$s</string>
+    <string name="status_mic_failed">mikrofon açılamadı ❌</string>
+    <string name="status_mic_failed_reason">mikrofon açılamadı: %1$s ❌</string>
+    <string name="status_opus_error">opus hatası: %1$s ❌</string>
+    <string name="status_stopped">durduruldu</string>
+    <string name="status_rtt">%1$s  (gecikme ~%2$d ms)</string>
+
+    <!-- Notification -->
+    <string name="notif_channel">Mikrofon akışı</string>
+    <string name="notif_muted">🔇 sessizde · %1$s</string>
+    <string name="action_mute">Sustur</string>
+    <string name="action_unmute">Sesi aç</string>
+
+    <!-- Toasts -->
+    <string name="toast_need_ip">IP adresi gir ya da listeden PC seç</string>
+    <string name="toast_sounds_stopped">Sesler durduruldu</string>
+    <string name="toast_mic_permission">Mikrofon izni olmadan olmaz 🙂</string>
+    <string name="toast_battery">Kesintisiz ses için pil kısıtlamasını kaldır 👍</string>
+</resources>
