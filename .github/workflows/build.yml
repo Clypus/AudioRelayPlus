@@ -64,6 +64,10 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # the action's default also asks for the legacy "tools" package,
+          # which the SDK repository no longer has
+          packages: platform-tools
       - name: Debug APK
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         run: |
